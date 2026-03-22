@@ -26,6 +26,7 @@ typedef struct {
  * Sits at the absolute 0-byte mark of every 4KB page.
  */
 typedef struct {
+    uint8_t page_type;      // 0 for DATA, 1 for BTREE_INDEX
     uint32_t page_id;       // Unique ID for this page (e.g., Page 0, Page 1)
     uint16_t num_slots;     // How many records are currently in this page
     
