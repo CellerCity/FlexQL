@@ -4,189 +4,135 @@
 #include "btree.h"
 #include "pager.h"
 
-// Helper function to compare two generic IndexKeys
-int compare_keys(IndexKey a, IndexKey b) {
-    // If types don't match, we have a schema error, but we'll default to 0 to avoid crashing
-    if (a.type != b.type) return 0; 
+// --- Prototypes ---
+void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, IndexKey new_key, RecordID new_record);
+void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id, uint32_t right_page_id, IndexKey key);
+void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id);
 
+int compare_keys(IndexKey a, IndexKey b) {
+    if (a.type != b.type) return 0; 
     switch (a.type) {
-        case 1: // INT
+        case 1: 
             if (a.value.int_val < b.value.int_val) return -1;
             if (a.value.int_val > b.value.int_val) return 1;
             return 0;
-            
-        case 2: // DECIMAL
+        case 2: 
             if (a.value.dec_val < b.value.dec_val) return -1;
             if (a.value.dec_val > b.value.dec_val) return 1;
             return 0;
-            
-        case 3: // DATETIME (int64_t)
+        case 3: 
             if (a.value.dt_val < b.value.dt_val) return -1;
             if (a.value.dt_val > b.value.dt_val) return 1;
             return 0;
-            
-        case 4: // VARCHAR (Fixed 32-byte limit for index keys)
-            // strncmp perfectly handles this by returning <0, 0, or >0
+        case 4: 
             return strncmp(a.value.str_val, b.value.str_val, 32); 
-            
-        default:
-            return 0;
+        default: return 0;
     }
 }
 
-
-
-// Searches the B+ Tree for a specific key.
-// Returns 1 if found (and populates 'result'), returns 0 if not found.
 int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, RecordID* result) {
-    
     uint32_t current_page_id = root_page_id;
 
-    // We loop until we hit a Leaf Node, then we break.
     while (1) {
-        // 1. Fetch the page from our Pager (Cache / Disk)
         Page* page = get_page(pager, current_page_id);
-        
-        // 2. Cast the raw data area into our BTreeNode struct
-        // Remember: The BTreeNode lives inside the page->data array!
         BTreeNode* node = (BTreeNode*)(page->data);
 
-        // 3. Find the first key in the node that is >= our search_key
         int i = 0;
-        while (i < node->num_keys && compare_keys(search_key, node->keys[i]) > 0) {
-            i++;
-        }
+        while (i < node->num_keys && compare_keys(search_key, node->keys[i]) > 0) i++;
 
-        // 4. Branch based on Node Type
         if (node->is_leaf) {
-            // We are at the bottom of the tree! 
-            // Check if the key we stopped at is an exact match.
             if (i < node->num_keys && compare_keys(search_key, node->keys[i]) == 0) {
-                // MATCH FOUND! 
                 result->page_num = node->payload.leaf_data.records[i].page_num;
                 result->slot_num = node->payload.leaf_data.records[i].slot_num;
+                unpin_page(pager, current_page_id, 0); // Release read lock
                 return 1; 
             } else {
-                // The key does not exist in the database.
+                unpin_page(pager, current_page_id, 0); 
                 return 0; 
             }
         } else {
-            // We are in an Internal Node. 
-            // The index 'i' corresponds exactly to the child pointer we need to follow.
-            current_page_id = node->payload.child_pages[i];
+            uint32_t next_page = node->payload.child_pages[i];
+            unpin_page(pager, current_page_id, 0); // Release parent before traversing child
+            current_page_id = next_page;
         }
     }
 }
 
-
-
-
-// src/storage/btree.c
-
-// Helper: Inserts a key and record into a leaf node that is GUARANTEED to have space.
 void insert_into_leaf(BTreeNode* leaf, IndexKey key, RecordID record) {
     int i = 0;
-    
-    // 1. Find the exact index where this key belongs
-    while (i < leaf->num_keys && compare_keys(key, leaf->keys[i]) > 0) {
-        i++;
-    }
-
-    // 2. Shift all keys and records to the right to make room
+    while (i < leaf->num_keys && compare_keys(key, leaf->keys[i]) > 0) i++;
     for (int j = leaf->num_keys; j > i; j--) {
         leaf->keys[j] = leaf->keys[j - 1];
         leaf->payload.leaf_data.records[j] = leaf->payload.leaf_data.records[j - 1];
     }
-
-    // 3. Insert the new key and record
     leaf->keys[i] = key;
     leaf->payload.leaf_data.records[i] = record;
     leaf->num_keys++;
 }
-
-
-
-// src/storage/btree.c
 
 void btree_insert(Pager* pager, uint32_t* root_page_id, IndexKey key, RecordID record) {
     uint32_t current_page_id = *root_page_id;
     Page* page = get_page(pager, current_page_id);
     BTreeNode* node = (BTreeNode*)(page->data);
 
-    // 1. If the tree is completely empty, initialize the root as a leaf
     if (node->num_keys == 0 && node->is_root) {
         node->is_leaf = 1;
         insert_into_leaf(node, key, record);
-        pager_flush(pager, current_page_id);
+        unpin_page(pager, current_page_id, 1); // Mark dirty and release
         return;
     }
 
-    // 2. Traverse down to the correct Leaf Node
     while (!node->is_leaf) {
         int i = 0;
-        while (i < node->num_keys && compare_keys(key, node->keys[i]) >= 0) {
-            i++;
-        }
-        current_page_id = node->payload.child_pages[i];
+        while (i < node->num_keys && compare_keys(key, node->keys[i]) >= 0) i++;
+        uint32_t next_page_id = node->payload.child_pages[i];
+        
+        unpin_page(pager, current_page_id, 0); // Release parent
+        current_page_id = next_page_id;
         page = get_page(pager, current_page_id);
         node = (BTreeNode*)(page->data);
     }
 
-    // 3. We are now at the Leaf Node. Check if it's full.
     if (node->num_keys < MAX_KEYS) {
-        // --- THE HAPPY PATH ---
         insert_into_leaf(node, key, record);
-        pager_flush(pager, current_page_id);
+        unpin_page(pager, current_page_id, 1);
     } else {
-        // --- THE SPLIT PATH ---
-        // The node has 110 keys. We must split it!
         split_leaf_node(pager, root_page_id, page, key, record);
     }
 }
 
-
-
-
-// src/storage/btree.c
-
 void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, IndexKey new_key, RecordID new_record) {
     BTreeNode* old_node = (BTreeNode*)old_page->data;
+    uint32_t old_page_id = old_page->header.page_id;
     
-    // 1. Allocate a brand new page for the right half of the split
     uint32_t new_page_id = pager->num_pages; 
     Page* new_page = get_page(pager, new_page_id);
     BTreeNode* new_node = (BTreeNode*)new_page->data;
     
-    // Initialize the new node
     new_node->is_leaf = 1;
     new_node->is_root = 0;
     new_node->num_keys = 0;
     new_node->parent_page_id = old_node->parent_page_id;
 
-    // 2. Create a temporary array to hold ALL keys (MAX_KEYS + 1) to easily sort them
     IndexKey temp_keys[MAX_KEYS + 1];
     RecordID temp_records[MAX_KEYS + 1];
     
     int insert_idx = 0;
-    while (insert_idx < MAX_KEYS && compare_keys(new_key, old_node->keys[insert_idx]) > 0) {
-        insert_idx++;
-    }
+    while (insert_idx < MAX_KEYS && compare_keys(new_key, old_node->keys[insert_idx]) > 0) insert_idx++;
     
-    // Copy everything into the temp arrays, inserting the new key at the right spot
-    for (int i = 0, j = 0; i < old_node->num_keys + 1; i++, j++) {
+    // Copy everything into the temp arrays safely!
+    for (int i = 0, j = 0; j < old_node->num_keys + 1; j++) {
         if (j == insert_idx) {
             temp_keys[j] = new_key;
             temp_records[j] = new_record;
-            i--; // Hold the old_node index back one step
         } else {
             temp_keys[j] = old_node->keys[i];
             temp_records[j] = old_node->payload.leaf_data.records[i];
+            i++; 
         }
     }
-
-    // 3. Distribute the keys: Left gets half, Right gets half
-    int split_point = (MAX_KEYS + 1) / 2;
     
+    int split_point = (MAX_KEYS + 1) / 2;
     old_node->num_keys = split_point;
     for (int i = 0; i < split_point; i++) {
         old_node->keys[i] = temp_keys[i];
@@ -199,27 +145,69 @@ void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, Index
         new_node->payload.leaf_data.records[j] = temp_records[i];
     }
 
-    // 4. Update the linked list pointers (for fast range scans)
     new_node->payload.leaf_data.next_leaf_page = old_node->payload.leaf_data.next_leaf_page;
     old_node->payload.leaf_data.next_leaf_page = new_page_id;
 
-    // 5. The Magic Step: Push the middle key UP to the parent!
-    IndexKey middle_key = new_node->keys[0]; // The smallest key in the new right node
+    IndexKey middle_key = new_node->keys[0]; 
     
     if (old_node->is_root) {
-        // If the root split, we must create a NEW root!
-        create_new_root(pager, root_page_id, old_page->header.page_id, new_page_id, middle_key);
+        create_new_root(pager, root_page_id, old_page_id, new_page_id, middle_key);
     } else {
-        // Otherwise, insert the middle key into the existing parent internal node
         insert_into_internal(pager, root_page_id, old_node->parent_page_id, middle_key, new_page_id);
     }
 
-    // 6. Flush our changes to disk
-    pager_flush(pager, old_page->header.page_id);
-    pager_flush(pager, new_page_id);
+    unpin_page(pager, old_page_id, 1);
+    unpin_page(pager, new_page_id, 1);
 }
 
+void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id, uint32_t right_page_id, IndexKey key) {
+    uint32_t new_root_id = pager->num_pages;
+    Page* root_page = get_page(pager, new_root_id);
+    BTreeNode* root_node = (BTreeNode*)root_page->data;
 
+    root_node->is_leaf = 0;
+    root_node->is_root = 1;
+    root_node->num_keys = 1;
+    root_node->keys[0] = key;
+    root_node->payload.child_pages[0] = left_page_id;
+    root_node->payload.child_pages[1] = right_page_id;
 
+    Page* left_page = get_page(pager, left_page_id);
+    BTreeNode* left_node = (BTreeNode*)left_page->data;
+    left_node->parent_page_id = new_root_id;
+    left_node->is_root = 0; 
+    unpin_page(pager, left_page_id, 1);
 
+    Page* right_page = get_page(pager, right_page_id);
+    BTreeNode* right_node = (BTreeNode*)right_page->data;
+    right_node->parent_page_id = new_root_id;
+    right_node->is_root = 0;
+    unpin_page(pager, right_page_id, 1);
 
+    unpin_page(pager, new_root_id, 1);
+    *root_page_id = new_root_id;
+}
+
+void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id) {
+    Page* parent_page = get_page(pager, parent_page_id);
+    BTreeNode* parent_node = (BTreeNode*)parent_page->data;
+
+    if (parent_node->num_keys >= MAX_KEYS) {
+        printf("[-] FATAL: Internal node split not yet implemented.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int i = 0;
+    while (i < parent_node->num_keys && compare_keys(key, parent_node->keys[i]) > 0) i++;
+
+    for (int j = parent_node->num_keys; j > i; j--) {
+        parent_node->keys[j] = parent_node->keys[j - 1];
+        parent_node->payload.child_pages[j + 1] = parent_node->payload.child_pages[j];
+    }
+
+    parent_node->keys[i] = key;
+    parent_node->payload.child_pages[i + 1] = right_child_page_id;
+    parent_node->num_keys++;
+
+    unpin_page(pager, parent_page_id, 1);
+}

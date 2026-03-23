@@ -20,12 +20,16 @@ Pager* pager_open(const char* filename) {
         exit(EXIT_FAILURE);
     }
 
+    
     off_t file_length = lseek(fd, 0, SEEK_END);
-
+    
     Pager* pager = malloc(sizeof(Pager));
     pager->file_descriptor = fd;
     pager->file_length = file_length;
     pager->num_pages = (file_length / PAGE_SIZE);
+
+    // Initialize the Global Cache Lock
+    pthread_mutex_init(&pager->global_cache_lock, NULL);
 
     // Initialize LRU List
     pager->head = NULL;
@@ -59,9 +63,25 @@ void pager_flush(Pager* pager, CacheNode* node) {
 
 // --- 3. The LRU Eviction (The Bouncer) ---
 void lru_evict(Pager* pager) {
+
+    // Note: This function assumes the caller already holds the global_cache_lock!
+    
     if (pager->head == NULL) return;
 
+    // Start at the head (Oldest), but keep looking if it is pinned!
     CacheNode* evict_node = pager->head;
+    while (evict_node != NULL && evict_node->pin_count > 0) {
+        evict_node = evict_node->next;
+    }
+
+    // If every single page in the cache is currently being used, we are out of memory.
+    if (evict_node == NULL) {
+        printf("[-] FATAL: Cache is full and all pages are pinned!\n");
+        exit(EXIT_FAILURE); 
+    }
+
+    // ... (The rest of the eviction logic remains exactly the same: flush if dirty, remove from DLL/Hash Map, and free memory) ...
+
 
     // Flush to disk ONLY if modified
     if (evict_node->is_dirty) {
@@ -91,47 +111,44 @@ void lru_evict(Pager* pager) {
     free(evict_node->page_data);
     free(evict_node);
     pager->current_cache_size--;
+
+
+    pthread_rwlock_destroy(&evict_node->page_lock); // Destroy the lock before freeing
 }
 
 // --- 4. The Core Logic: Get Page ---
 Page* get_page(Pager* pager, uint32_t page_num) {
+    // 1. Lock the entire cache structure before touching pointers
+    pthread_mutex_lock(&pager->global_cache_lock);
+
     uint32_t bucket_idx = hash_page(page_num);
     CacheNode* node = pager->lookup_table->buckets[bucket_idx];
 
-    // SEARCH HASH MAP FOR CACHE HIT
+    // --- CACHE HIT ---
     while (node != NULL) {
         if (node->page_num == page_num) {
-            // CACHE HIT! Move this node to the tail (Most Recently Used)
-            if (node != pager->tail) {
-                // Rip it out of current position
-                if (node == pager->head) {
-                    pager->head = node->next;
-                    pager->head->prev = NULL;
-                } else {
-                    node->prev->next = node->next;
-                    node->next->prev = node->prev;
-                }
-                // Attach to tail
-                node->prev = pager->tail;
-                node->next = NULL;
-                pager->tail->next = node;
-                pager->tail = node;
-            }
+            // Move to tail (MRU) logic here...
+            
+            node->pin_count++; // Pin it so the bouncer doesn't grab it
+            pthread_mutex_unlock(&pager->global_cache_lock); // Release global lock
             return node->page_data;
         }
         node = node->hash_next;
     }
 
-    // CACHE MISS: We must load it from disk
+    // --- CACHE MISS ---
     if (pager->current_cache_size >= MAX_CACHE_PAGES) {
-        lru_evict(pager);
+        lru_evict(pager); // Bouncer runs while global lock is held
     }
 
-    // Create new node and page
     CacheNode* new_node = malloc(sizeof(CacheNode));
     new_node->page_num = page_num;
     new_node->page_data = malloc(sizeof(Page));
-    new_node->is_dirty = 0; // Clean by default when loaded
+    new_node->is_dirty = 0;
+    
+    // Initialize concurrency state
+    new_node->pin_count = 1; 
+    pthread_rwlock_init(&new_node->page_lock, NULL);
 
     // Read from disk or initialize empty page
     if (page_num < pager->num_pages) {
@@ -144,6 +161,11 @@ Page* get_page(Pager* pager, uint32_t page_num) {
         new_node->page_data->header.free_space_ptr = PAGE_SIZE;
         // If we are creating a brand new page, it must be saved to disk eventually!
         new_node->is_dirty = 1; 
+
+        // --- Update total pages! ---
+        if (page_num >= pager->num_pages) {
+            pager->num_pages = page_num + 1;
+        }
     }
 
     // Add to Hash Map (Insert at head of bucket for speed)
@@ -163,13 +185,42 @@ Page* get_page(Pager* pager, uint32_t page_num) {
     }
 
     pager->current_cache_size++;
+    pthread_mutex_unlock(&pager->global_cache_lock); // Release global lock
     return new_node->page_data;
 }
 
-// --- 5. Safely Close and Flush Everything ---
+// --- 5. The Engine must release the page when done! ---
+void unpin_page(Pager* pager, uint32_t page_num, int is_dirty) {
+    pthread_mutex_lock(&pager->global_cache_lock);
+    
+    uint32_t bucket_idx = hash_page(page_num);
+    CacheNode* node = pager->lookup_table->buckets[bucket_idx];
+    
+    while (node != NULL) {
+        if (node->page_num == page_num) {
+            node->pin_count--;
+            if (is_dirty) {
+                node->is_dirty = 1; // Mark for eventual flush
+            }
+            break;
+        }
+        node = node->hash_next;
+    }
+    
+    pthread_mutex_unlock(&pager->global_cache_lock);
+}
+
+
+// --- 6. Safely Close and Flush Everything ---
 void pager_close(Pager* pager) {
+    // Destroy the global lock
+    pthread_mutex_destroy(&pager->global_cache_lock);
+
     CacheNode* curr = pager->head;
     while (curr != NULL) {
+        pthread_rwlock_destroy(&curr->page_lock);
+        
+        // ... (free logic) ...
         CacheNode* next = curr->next;
         if (curr->is_dirty) {
             pager_flush(pager, curr);

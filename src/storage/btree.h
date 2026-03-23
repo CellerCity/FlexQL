@@ -32,9 +32,9 @@ typedef struct {
 
 
 // --- The Updated B+ Tree Node ---
-// Because IndexKey is 36 bytes, we must reduce MAX_KEYS to fit inside the 4096-byte page.
-// (4096 bytes / 36 bytes) = Roughly 110 keys max per node.
-#define MAX_KEYS 110 
+// Because IndexKey is 40 bytes (due to padding), we must reduce MAX_KEYS 
+// to safely fit inside the 4096-byte page.
+#define MAX_KEYS 80
 
 typedef struct {
     uint8_t is_leaf;          
@@ -58,7 +58,7 @@ typedef struct {
 
 // --- Function Prototypes ---
 // Core logic for searching and inserting
-RecordID* btree_search(Pager* pager, uint32_t root_page_id, uint32_t search_key);
-void btree_insert(Pager* pager, uint32_t root_page_id, uint32_t key, RecordID record);
+int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, RecordID* result);
+void btree_insert(Pager* pager, uint32_t* root_page_id, IndexKey key, RecordID record);
 
 #endif
