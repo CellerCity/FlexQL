@@ -20,12 +20,41 @@ void trim_string(char *str) {
 
 ParsedQuery parse_sql(const char* sql_string) {
     ParsedQuery query;
-    memset(&query, 0, sizeof(ParsedQuery)); // Initialize struct with zeros
+
+
+    // --- THE ARENA OPTIMIZATION ---
+    // REMOVE THIS LINE:
+    // memset(&query, 0, sizeof(ParsedQuery)); 
+    
+    // REPLACE WITH TARGETED RESETS:
     query.type = CMD_UNKNOWN;
     query.is_valid = 0;
+    
+    // Reset Counters
+    query.column_count = 0;
+    query.value_count = 0;
+    query.select_column_count = 0;
+    
+    // Reset Flags
+    query.has_join = 0;
+    query.has_where = 0;
+    
+    // Null-terminate the strings (This takes 1 byte of writing instead of 256 bytes!)
+    query.table_name[0] = '\0';
+    query.db_name[0] = '\0';
+    query.error_msg[0] = '\0';
+    query.where_column[0] = '\0';
+    query.where_operator[0] = '\0';
+    query.where_value[0] = '\0';
+    query.join_table[0] = '\0';
+    query.join_condition_left[0] = '\0';
+    query.join_condition_right[0] = '\0';
+    // ------------------------------
 
     // Make a working copy of the string (strtok modifies the original)
     char sql_copy[1024];
+        
+
     strncpy(sql_copy, sql_string, sizeof(sql_copy) - 1);
     sql_copy[sizeof(sql_copy) - 1] = '\0';
 
