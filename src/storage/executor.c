@@ -74,7 +74,8 @@ void execute_drop_db(ParsedQuery* query, char* current_db_session) {
 
 
 // --- 1. Your Excellent Serialization Logic ---
-uint16_t serialize_row(ParsedQuery* query, ColumnDef* schema, char* tuple_buffer) {
+// Change the signature to take `int* cached_types` instead of `ColumnDef* schema`
+uint16_t serialize_row(ParsedQuery* query, int* cached_types, char* tuple_buffer) {
     uint16_t current_offset = 0;
 
     // Mandatory Expiration Timestamp
@@ -85,15 +86,19 @@ uint16_t serialize_row(ParsedQuery* query, ColumnDef* schema, char* tuple_buffer
     current_offset += sizeof(TupleHeader);
 
     for (int i = 0; i < query->value_count; i++) {
-        if (strcasecmp(schema[i].type, "INT") == 0) {
+        // --- O(1) INTEGER CHECKS ---
+        if (cached_types[i] == 1) { 
+            // INT
             int32_t val = atoi(query->values[i]);
             memcpy(tuple_buffer + current_offset, &val, sizeof(int32_t));
             current_offset += sizeof(int32_t);
-        } else if (strcasecmp(schema[i].type, "DECIMAL") == 0) {
+        } else if (cached_types[i] == 2) { 
+            // DECIMAL
             double val = atof(query->values[i]);
             memcpy(tuple_buffer + current_offset, &val, sizeof(double));
             current_offset += sizeof(double);
-        } else if (strcasecmp(schema[i].type, "DATETIME") == 0) {
+        } else if (cached_types[i] == 3) { 
+            // DATETIME
             struct tm tm_info;
             memset(&tm_info, 0, sizeof(struct tm));
             int64_t timestamp = 0;
@@ -103,7 +108,8 @@ uint16_t serialize_row(ParsedQuery* query, ColumnDef* schema, char* tuple_buffer
             }
             memcpy(tuple_buffer + current_offset, &timestamp, sizeof(int64_t));
             current_offset += sizeof(int64_t);
-        } else if (strcasecmp(schema[i].type, "TEXT") == 0 || strcasecmp(schema[i].type, "VARCHAR") == 0) {
+        } else { 
+            // TEXT or VARCHAR (cached_types[i] == 4)
             uint16_t len = strlen(query->values[i]);
             memcpy(tuple_buffer + current_offset, &len, sizeof(uint16_t));
             current_offset += sizeof(uint16_t);
@@ -212,13 +218,21 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
     static char cached_table[256] = "";
     static ColumnDef cached_schema[100];
     static int cached_num_cols = 0;
+    static int cached_types[100]; // NEW: Hold pre-computed integer types!
 
-
-     // Only hit the hard drive if the user queries a DIFFERENT table!
+    // Only hit the hard drive if the user queries a DIFFERENT table!
     if (strcmp(cached_table, query->table_name) != 0) {
         cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
         if (cached_num_cols != -1) {
             strcpy(cached_table, query->table_name);
+            
+            // Pre-compute the types so we never use strcasecmp again!
+            for (int i = 0; i < cached_num_cols; i++) {
+                if (strcasecmp(cached_schema[i].type, "INT") == 0) cached_types[i] = 1;
+                else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) cached_types[i] = 2;
+                else if (strcasecmp(cached_schema[i].type, "DATETIME") == 0) cached_types[i] = 3;
+                else cached_types[i] = 4; // VARCHAR / TEXT
+            }
         }
     }
 
@@ -226,31 +240,50 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
         printf("[-] Error: Table '%s' does not exist.\n", query->table_name);
         return;
     }
-    
 
-    // 1. Serialize row
+    // 1. Serialize row (Now passing the cached integer array!)
     char tuple_buffer[MAX_TUPLE_SIZE];
-    uint16_t tuple_size = serialize_row(query, cached_schema, tuple_buffer);
+    uint16_t tuple_size = serialize_row(query, cached_types, tuple_buffer);
 
     // 2. Drop into Data Page
     RecordID record_location = append_to_data_page(pager, active_data_page, tuple_buffer, tuple_size);
 
     // 3. Extract Primary Key and link to B+ Tree
     IndexKey pk;
-    if (strcasecmp(cached_schema[0].type, "INT") == 0) {
+    
+    // --- O(1) INTEGER CHECKS FOR ALL TYPES ---
+    if (cached_types[0] == 1) { 
+        // INT
         pk.type = 1;
         pk.value.int_val = atoi(query->values[0]);
-    } else if (strcasecmp(cached_schema[0].type, "VARCHAR") == 0) {
+    } 
+    else if (cached_types[0] == 2) { 
+        // DECIMAL
+        pk.type = 2;
+        pk.value.dec_val = atof(query->values[0]);
+    } 
+    else if (cached_types[0] == 3) { 
+        // DATETIME
+        pk.type = 3;
+        struct tm tm_info;
+        memset(&tm_info, 0, sizeof(struct tm));
+        int64_t timestamp = 0;
+        if (strptime(query->values[0], "%Y-%m-%d %H:%M:%S", &tm_info) != NULL ||
+            strptime(query->values[0], "%Y-%m-%d", &tm_info) != NULL) {
+            timestamp = (int64_t)mktime(&tm_info);
+        }
+        pk.value.dt_val = timestamp;
+    } 
+    else { 
+        // VARCHAR
         pk.type = 4;
         strncpy(pk.value.str_val, query->values[0], 32);
     }
-    // Note: You can add DECIMAL/DATETIME PK extraction here based on your schema
 
     btree_insert(pager, root_page_id, pk, record_location);
-
-    // MUTING THE PRINT STATEMENT
-    // printf("[+] Inserted row into '%s' at Page %u, Slot %u.\n", query->table_name, record_location.page_num, record_location.slot_num); 
 }
+
+
 
 
 void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock) {
@@ -267,11 +300,21 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
     static ColumnDef cached_schema[100];
     static int cached_num_cols = 0;
 
+    // Array to hold pre-computed integer types! (1=INT, 2=DECIMAL, 3=STRING)
+    static int cached_types[100];
+
     // Only hit the hard drive if the user queries a DIFFERENT table!
     if (strcmp(cached_table, query->table_name) != 0) {
         cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
         if (cached_num_cols != -1) {
             strcpy(cached_table, query->table_name);
+            
+            // THE OPTIMIZATION: Translate the slow strings into fast integers ONCE!
+            for (int i = 0; i < cached_num_cols; i++) {
+                if (strcasecmp(cached_schema[i].type, "INT") == 0) cached_types[i] = 1;
+                else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) cached_types[i] = 2;
+                else cached_types[i] = 3; 
+            }
         }
     }
 
@@ -281,9 +324,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         return;
     }
 
-    // 1. Setup Search Key
+    // 1. Setup Search Key (NO MORE STRING COMPARISON!)
     IndexKey search_key;
-    if (strcasecmp(cached_schema[0].type, "INT") == 0) {
+    if (cached_types[0] == 1) { 
         search_key.type = 1;
         search_key.value.int_val = atoi(query->where_value); 
     } else {
@@ -326,7 +369,8 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                 *ptr++ = '|';
 
                 // 3. Process the data
-                if (strcasecmp(cached_schema[i].type, "INT") == 0) {
+                // CRITICAL SPEEDUP: Single-cycle integer checks instead of strcasecmp!
+                if (cached_types[i] == 1) {
                     int32_t val;
                     memcpy(&val, raw_record + offset, sizeof(int32_t));
                     
@@ -334,12 +378,13 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                     ptr += sprintf(ptr, "%d", val); 
                     
                     offset += sizeof(int32_t);
-                } else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) {
+                } else if (cached_types[i] == 2) {
                     double val;
                     memcpy(&val, raw_record + offset, sizeof(double));
                     ptr += sprintf(ptr, "%.2f", val);
                     offset += sizeof(double);
-                } else if (strcasecmp(cached_schema[i].type, "VARCHAR") == 0 || strcasecmp(cached_schema[i].type, "TEXT") == 0) {
+                } else {
+                    // varchar
                     uint16_t len;
                     memcpy(&len, raw_record + offset, sizeof(uint16_t));
                     offset += sizeof(uint16_t);
