@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include "flexql.h" // Ensure this path points to your flexql.h file
 
 // 1. The Opaque Structure
@@ -20,6 +21,12 @@ int flexql_open(const char *host, int port, FlexQL **db) {
     if (*db == NULL) return FLEXQL_ERROR;
 
     (*db)->sockfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    // --- THE FIX: Disable Nagle's Algorithm ---
+    int flag = 1;
+    setsockopt((*db)->sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    // ------------------------------------------
+
     if ((*db)->sockfd < 0) {
         free(*db);
         return FLEXQL_ERROR;

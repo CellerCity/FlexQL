@@ -208,27 +208,39 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
         return;
     }
     
-    ColumnDef schema[100];
-    int num_cols = load_schema(current_db, query->table_name, schema);
-    
-    if (num_cols == -1) {
+    // --- THE SCHEMA CACHE OPTIMIZATION ---
+    static char cached_table[256] = "";
+    static ColumnDef cached_schema[100];
+    static int cached_num_cols = 0;
+
+
+     // Only hit the hard drive if the user queries a DIFFERENT table!
+    if (strcmp(cached_table, query->table_name) != 0) {
+        cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
+        if (cached_num_cols != -1) {
+            strcpy(cached_table, query->table_name);
+        }
+    }
+
+    if (cached_num_cols == -1) {
         printf("[-] Error: Table '%s' does not exist.\n", query->table_name);
         return;
     }
+    
 
     // 1. Serialize row
     char tuple_buffer[MAX_TUPLE_SIZE];
-    uint16_t tuple_size = serialize_row(query, schema, tuple_buffer);
+    uint16_t tuple_size = serialize_row(query, cached_schema, tuple_buffer);
 
     // 2. Drop into Data Page
     RecordID record_location = append_to_data_page(pager, active_data_page, tuple_buffer, tuple_size);
 
     // 3. Extract Primary Key and link to B+ Tree
     IndexKey pk;
-    if (strcasecmp(schema[0].type, "INT") == 0) {
+    if (strcasecmp(cached_schema[0].type, "INT") == 0) {
         pk.type = 1;
         pk.value.int_val = atoi(query->values[0]);
-    } else if (strcasecmp(schema[0].type, "VARCHAR") == 0) {
+    } else if (strcasecmp(cached_schema[0].type, "VARCHAR") == 0) {
         pk.type = 4;
         strncpy(pk.value.str_val, query->values[0], 32);
     }
@@ -250,17 +262,28 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         return;
     }
 
-    ColumnDef schema[100];
-    int num_cols = load_schema(current_db, query->table_name, schema);
-    if (num_cols == -1) {
-        sprintf(net_buffer, "ERROR|Table '%s' does not exist in database '%s'.\n", query->table_name, current_db);
+    // --- THE SCHEMA CACHE OPTIMIZATION ---
+    static char cached_table[256] = "";
+    static ColumnDef cached_schema[100];
+    static int cached_num_cols = 0;
+
+    // Only hit the hard drive if the user queries a DIFFERENT table!
+    if (strcmp(cached_table, query->table_name) != 0) {
+        cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
+        if (cached_num_cols != -1) {
+            strcpy(cached_table, query->table_name);
+        }
+    }
+
+    if (cached_num_cols == -1) {
+        sprintf(net_buffer, "ERROR|Table '%s' does not exist.\n", query->table_name);
         send(client_sock, net_buffer, strlen(net_buffer), 0);
         return;
     }
 
     // 1. Setup Search Key
     IndexKey search_key;
-    if (strcasecmp(schema[0].type, "INT") == 0) {
+    if (strcasecmp(cached_schema[0].type, "INT") == 0) {
         search_key.type = 1;
         search_key.value.int_val = atoi(query->where_value); 
     } else {
@@ -286,44 +309,58 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             sprintf(net_buffer, "ERROR|Record found, but it has EXPIRED.\n");
             send(client_sock, net_buffer, strlen(net_buffer), 0);
         } else {
-            // --- BUILD THE MACHINE-READABLE ROW PACKET ---
-            // Format: ROW|num_cols|col1_name|col1_val|col2_name|col2_val\n
-            sprintf(net_buffer, "ROW|%d", num_cols);
+            // --- THE HIGH-PERFORMANCE MEMORY BLASTER ---
+            char* ptr = net_buffer; // Start the pointer at the beginning of the buffer
             
-            char temp_str[256];
+            // 1. Write the header and advance the pointer by the exact number of bytes written
+            ptr += sprintf(ptr, "ROW|%d", cached_num_cols);
+            
             uint16_t offset = sizeof(TupleHeader); 
 
-            for (int i = 0; i < num_cols; i++) {
-                if (strcasecmp(schema[i].type, "INT") == 0) {
+            for (int i = 0; i < cached_num_cols; i++) {
+                // 2. Direct memory writes for the column name (Bypasses sprintf parsing)
+                *ptr++ = '|'; // Drop a pipe and move the pointer 1 byte
+                int name_len = strlen(cached_schema[i].name);
+                memcpy(ptr, cached_schema[i].name, name_len);
+                ptr += name_len;
+                *ptr++ = '|';
+
+                // 3. Process the data
+                if (strcasecmp(cached_schema[i].type, "INT") == 0) {
                     int32_t val;
                     memcpy(&val, raw_record + offset, sizeof(int32_t));
-                    sprintf(temp_str, "|%s|%d", schema[i].name, val);
-                    strcat(net_buffer, temp_str);
+                    
+                    // We still use sprintf for the number, but we write it directly to the pointer
+                    ptr += sprintf(ptr, "%d", val); 
+                    
                     offset += sizeof(int32_t);
-                } else if (strcasecmp(schema[i].type, "DECIMAL") == 0) {
+                } else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) {
                     double val;
                     memcpy(&val, raw_record + offset, sizeof(double));
-                    sprintf(temp_str, "|%s|%.2f", schema[i].name, val);
-                    strcat(net_buffer, temp_str);
+                    ptr += sprintf(ptr, "%.2f", val);
                     offset += sizeof(double);
-                } else if (strcasecmp(schema[i].type, "VARCHAR") == 0 || strcasecmp(schema[i].type, "TEXT") == 0) {
+                } else if (strcasecmp(cached_schema[i].type, "VARCHAR") == 0 || strcasecmp(cached_schema[i].type, "TEXT") == 0) {
                     uint16_t len;
                     memcpy(&len, raw_record + offset, sizeof(uint16_t));
                     offset += sizeof(uint16_t);
-                    char str_val[256] = {0};
-                    memcpy(str_val, raw_record + offset, len);
-                    sprintf(temp_str, "|%s|%s", schema[i].name, str_val);
-                    strcat(net_buffer, temp_str);
+                    
+                    // CRITICAL SPEEDUP: Direct memory copy for strings! No format parsing!
+                    memcpy(ptr, raw_record + offset, len);
+                    ptr += len;
+                    
                     offset += len;
                 }
             }
-            strcat(net_buffer, "\n"); // Cap off the packet with a newline
-
-            // Append the DONE message to the SAME buffer -- to avoid the 40ms OS delay when sending consecutive short packets
-            strcat(net_buffer, "DONE|Query executed successfully.\n");
             
-            // Send everything in ONE single TCP packet to bypass the 40ms penalty!
-            send(client_sock, net_buffer, strlen(net_buffer), 0);
+            // 4. Append the DONE message directly to the pointer
+            const char* done_msg = "\nDONE|Query executed successfully.\n";
+            int done_len = 35; // We hardcode the length because we know exactly how long it is
+            memcpy(ptr, done_msg, done_len);
+            ptr += done_len;
+            
+            // 5. Send exactly the bytes we wrote! 
+            // Notice we use (ptr - net_buffer) to calculate the size. NO STRLEN ALLOWED!
+            send(client_sock, net_buffer, ptr - net_buffer, 0);
         }
         
         unpin_page(pager, result.page_num, 0); 

@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 
 #include "../parser/parser.h"
 #include "../storage/executor.h"
@@ -181,6 +182,11 @@ int main() {
             perror("[-] Accept failed");
             continue;
         }
+
+        // --- THE FIX: Disable Nagle's Algorithm for the server responses ---
+        int flag = 1;
+        setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+        // -------------------------------------------------------------------
 
         printf("[+] New connection accepted from %s:%d\n", 
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
