@@ -37,10 +37,11 @@ int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, Recor
         Page* page = get_page(pager, current_page_id);
         BTreeNode* node = (BTreeNode*)(page->data);
 
-        int i = 0;
-        while (i < node->num_keys && compare_keys(search_key, node->keys[i]) > 0) i++;
-
         if (node->is_leaf) {
+            int i = 0;
+            // LEAF NODE: We want to stop exactly ON the match (> 0)
+            while (i < node->num_keys && compare_keys(search_key, node->keys[i]) > 0) i++;
+
             if (i < node->num_keys && compare_keys(search_key, node->keys[i]) == 0) {
                 result->page_num = node->payload.leaf_data.records[i].page_num;
                 result->slot_num = node->payload.leaf_data.records[i].slot_num;
@@ -51,6 +52,10 @@ int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, Recor
                 return 0; 
             }
         } else {
+            int i = 0;
+            // INTERNAL NODE: We want to pass the match to take the right child path (>= 0)
+            while (i < node->num_keys && compare_keys(search_key, node->keys[i]) >= 0) i++;
+            
             uint32_t next_page = node->payload.child_pages[i];
             unpin_page(pager, current_page_id, 0); // Release parent before traversing child
             current_page_id = next_page;
@@ -188,15 +193,158 @@ void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id
     *root_page_id = new_root_id;
 }
 
+
+
+uint32_t find_parent(Pager* pager, uint32_t root_page_id, uint32_t target_page_id) {
+    if (root_page_id == target_page_id) return 0; // The root has no parent!
+
+    // 1. Get the "GPS Coordinate" (the first key) of the target page
+    Page* target_page = get_page(pager, target_page_id);
+    BTreeNode* target_node = (BTreeNode*)target_page->data;
+    IndexKey routing_key = target_node->keys[0]; 
+    unpin_page(pager, target_page_id, 0);
+
+    uint32_t current_page_id = root_page_id;
+
+    // 2. Traverse down the tree using the routing key
+    while (1) {
+        Page* page = get_page(pager, current_page_id);
+        BTreeNode* node = (BTreeNode*)page->data;
+
+        // If we somehow hit a leaf, the parent doesn't exist (safety catch)
+        if (node->is_leaf) {
+            unpin_page(pager, current_page_id, 0);
+            return 0; 
+        }
+
+        // 3. Check if one of THIS node's children is the target page
+        for (int i = 0; i <= node->num_keys; i++) {
+            if (node->payload.child_pages[i] == target_page_id) {
+                unpin_page(pager, current_page_id, 0);
+                return current_page_id; // We found the parent!
+            }
+        }
+
+        // 4. If not found, figure out which child branch to follow
+        int i = 0;
+        while (i < node->num_keys && compare_keys(routing_key, node->keys[i]) >= 0) {
+            i++;
+        }
+        
+        uint32_t next_page_id = node->payload.child_pages[i];
+        unpin_page(pager, current_page_id, 0); // Unpin before moving down
+        current_page_id = next_page_id;
+    }
+}
+
+
 void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id) {
     Page* parent_page = get_page(pager, parent_page_id);
     BTreeNode* parent_node = (BTreeNode*)parent_page->data;
 
+    // ==========================================
+    // THE INTERNAL NODE SPLIT LOGIC
+    // ==========================================
     if (parent_node->num_keys >= MAX_KEYS) {
-        printf("[-] FATAL: Internal node split not yet implemented.\n");
-        exit(EXIT_FAILURE);
+        
+        // 1. Create temporary arrays to hold the overflow (MAX_KEYS + 1)
+        IndexKey temp_keys[MAX_KEYS + 1];
+        uint32_t temp_children[MAX_KEYS + 2];
+
+        // Copy existing keys and children to temp arrays
+        for (int i = 0; i < MAX_KEYS; i++) {
+            temp_keys[i] = parent_node->keys[i];
+            temp_children[i] = parent_node->payload.child_pages[i];
+        }
+        temp_children[MAX_KEYS] = parent_node->payload.child_pages[MAX_KEYS];
+
+        // Find where the new key should be inserted in the temp arrays
+        int insert_idx = 0;
+        while (insert_idx < MAX_KEYS && compare_keys(key, temp_keys[insert_idx]) > 0) {
+            insert_idx++;
+        }
+
+        // Shift to make room for the new key and child pointer
+        for (int j = MAX_KEYS; j > insert_idx; j--) {
+            temp_keys[j] = temp_keys[j - 1];
+            temp_children[j + 1] = temp_children[j];
+        }
+        
+        // Insert the new key and child
+        temp_keys[insert_idx] = key;
+        temp_children[insert_idx + 1] = right_child_page_id;
+
+        // 2. Determine the middle index to split and promote
+        int split_idx = (MAX_KEYS + 1) / 2;
+        IndexKey promoted_key = temp_keys[split_idx];
+
+        // 3. Create the new Right Internal Node
+        uint32_t new_right_page_id = pager->num_pages;
+        Page* new_right_page = get_page(pager, new_right_page_id);
+        new_right_page->header.page_type = 1; // Mark as an Index Page
+        
+        BTreeNode* right_node = (BTreeNode*)new_right_page->data;
+        right_node->is_leaf = 0;
+        right_node->is_root = 0;
+
+        // 4. Update Left Node (the original parent_node)
+        parent_node->num_keys = split_idx;
+        for (int i = 0; i < split_idx; i++) {
+            parent_node->keys[i] = temp_keys[i];
+            parent_node->payload.child_pages[i] = temp_children[i];
+        }
+        parent_node->payload.child_pages[split_idx] = temp_children[split_idx];
+
+        // 5. Update Right Node
+        // Notice we start 'j' at split_idx + 1 because the middle key is PROMOTED!
+        right_node->num_keys = MAX_KEYS - split_idx;
+        for (int i = 0, j = split_idx + 1; i < right_node->num_keys; i++, j++) {
+            right_node->keys[i] = temp_keys[j];
+            right_node->payload.child_pages[i] = temp_children[j];
+        }
+        right_node->payload.child_pages[right_node->num_keys] = temp_children[MAX_KEYS + 1];
+
+        // 6. Handle the Promoted Key (Recursive Tree Growth)
+        if (parent_node->is_root) {
+            // If we split the root, we must create a BRAND NEW root above it!
+            uint32_t new_root_page_id = pager->num_pages;
+            Page* new_root_page = get_page(pager, new_root_page_id);
+            new_root_page->header.page_type = 1; // Index Page
+            
+            BTreeNode* new_root_node = (BTreeNode*)new_root_page->data;
+            new_root_node->is_leaf = 0;
+            new_root_node->is_root = 1;
+            new_root_node->num_keys = 1;
+            new_root_node->keys[0] = promoted_key;
+            
+            // Point the new root at the left and right nodes
+            new_root_node->payload.child_pages[0] = parent_page_id; 
+            new_root_node->payload.child_pages[1] = new_right_page_id;
+
+            parent_node->is_root = 0; // Old root is no longer root
+            *root_page_id = new_root_page_id; // Update global root tracking
+
+            unpin_page(pager, new_root_page_id, 1);
+            unpin_page(pager, new_right_page_id, 1);
+            unpin_page(pager, parent_page_id, 1);
+            return; 
+        } else {
+            // Normal internal node split. Push the promoted key UP to the grandparent!
+            unpin_page(pager, new_right_page_id, 1);
+            unpin_page(pager, parent_page_id, 1);
+            
+            // NOTE: We must search the tree to find who the parent of parent_page_id is
+            uint32_t grand_parent_id = find_parent(pager, *root_page_id, parent_page_id);
+            
+            // Recursively call this exact function to push it up!
+            insert_into_internal(pager, root_page_id, grand_parent_id, promoted_key, new_right_page_id);
+            return;
+        }
     }
 
+    // ==========================================
+    // THE STANDARD INSERT LOGIC (If not full)
+    // ==========================================
     int i = 0;
     while (i < parent_node->num_keys && compare_keys(key, parent_node->keys[i]) > 0) i++;
 

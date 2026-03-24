@@ -133,46 +133,76 @@ int insert_into_page(Page* page, const char* tuple_buffer, uint16_t tuple_size) 
     return 0; 
 }
 
-// --- 3. NEW: The Thread-Safe Pager Wrapper ---
-RecordID append_to_data_page(Pager* pager, const char* tuple_buffer, uint16_t tuple_size) {
-    // Try to insert into the last page in the file
-    uint32_t data_page_id = pager->num_pages > 0 ? pager->num_pages - 1 : 0;
-    Page* page = get_page(pager, data_page_id);
+// --- 3. The Thread-Safe Pager Wrapper ---
+RecordID append_to_data_page(Pager* pager, uint32_t* active_data_page, const char* tuple_buffer, uint16_t tuple_size) {
+    
+    Page* page = get_page(pager, *active_data_page);
 
-    // If it's an index page or it's full, we need a brand new page
+    // SAFETY NET: If this page is brand new, its free_space_ptr is 0. We MUST initialize it!
+    if (page->header.free_space_ptr == 0) {
+        page->header.page_type = 0;
+        page->header.num_slots = 0;
+        page->header.free_space_ptr = 4096;
+    }
+
+    // If it's an index page, or it's full...
     if (page->header.page_type != 0 || insert_into_page(page, tuple_buffer, tuple_size) == -1) {
-        unpin_page(pager, data_page_id, 0); // Release the old page
+        unpin_page(pager, *active_data_page, 0); 
         
-        data_page_id = pager->num_pages; // Grab a fresh page
-        page = get_page(pager, data_page_id);
-        page->header.page_type = 0; // Mark as DATA
+        // Jump to the absolute end of the file to guarantee we don't hit a B-Tree node
+        *active_data_page = pager->num_pages; 
+        page = get_page(pager, *active_data_page);
+        
+        page->header.page_type = 0; 
+        page->header.num_slots = 0;
+        page->header.free_space_ptr = 4096; 
         
         insert_into_page(page, tuple_buffer, tuple_size); 
     }
 
-    uint16_t slot_num = page->header.num_slots - 1; // Get the slot we just created
-    unpin_page(pager, data_page_id, 1); // Done writing, mark as dirty!
+    uint16_t slot_num = page->header.num_slots - 1; 
+    unpin_page(pager, *active_data_page, 1); // Mark dirty to save to disk
 
-    RecordID rec = { .page_num = data_page_id, .slot_num = slot_num };
+    RecordID rec = { .page_num = *active_data_page, .slot_num = slot_num };
     return rec;
 }
-
 // =========================================================
 //                   THE MAIN EXECUTOR API
 // =========================================================
 
 void execute_create(const char* current_db, ParsedQuery* query) {
     if (strlen(current_db) == 0) {
-        printf("[-] Error: No database selected. Use 'USE <dbname>;' first.\n");
+        printf("[-] Error: No database selected.\n");
         return;
     }
 
     if (save_schema(current_db, query->table_name, query->columns, query->column_count) == 0) {
+        
+        // --- NEW: Initialize the B+ Tree Root Page immediately! ---
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, query->table_name);
+        Pager* pager = pager_open(filepath);
+        
+        Page* root_page = get_page(pager, 0);
+
+        // --- Mark as an Index Page so Data doesn't overwrite it! ---
+        root_page->header.page_type = 1;
+
+        BTreeNode* root_node = (BTreeNode*)root_page->data;
+        root_node->is_leaf = 1;
+        root_node->is_root = 1;
+        root_node->num_keys = 0;
+        
+        unpin_page(pager, 0, 1); // Mark as dirty so it saves to disk
+        pager_close(pager);
+        // -----------------------------------------------------------
+        
         printf("[+] Table '%s' created in database '%s'.\n", query->table_name, current_db);
     }
 }
 
-void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id, ParsedQuery* query) {
+
+void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id, uint32_t* active_data_page, ParsedQuery* query) {
     if (strlen(current_db) == 0) {
         printf("[-] Error: No database selected. Use 'USE <dbname>;' first.\n");
         return;
@@ -191,7 +221,7 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
     uint16_t tuple_size = serialize_row(query, schema, tuple_buffer);
 
     // 2. Drop into Data Page
-    RecordID record_location = append_to_data_page(pager, tuple_buffer, tuple_size);
+    RecordID record_location = append_to_data_page(pager, active_data_page, tuple_buffer, tuple_size);
 
     // 3. Extract Primary Key and link to B+ Tree
     IndexKey pk;
@@ -205,19 +235,26 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
     // Note: You can add DECIMAL/DATETIME PK extraction here based on your schema
 
     btree_insert(pager, root_page_id, pk, record_location);
-    printf("[+] Inserted row into '%s' at Page %u, Slot %u.\n", 
-           query->table_name, record_location.page_num, record_location.slot_num);
+
+    // MUTING THE PRINT STATEMENT
+    // printf("[+] Inserted row into '%s' at Page %u, Slot %u.\n", query->table_name, record_location.page_num, record_location.slot_num); 
 }
 
-void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query) {
+
+void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock) {
+    char net_buffer[2048]; // Buffer to build our network packets
+
     if (strlen(current_db) == 0) {
-        printf("[-] Error: No database selected. Use 'USE <dbname>;' first.\n");
+        sprintf(net_buffer, "ERROR|No database selected. Use 'USE <dbname>;' first.\n");
+        send(client_sock, net_buffer, strlen(net_buffer), 0);
         return;
     }
-    
+
     ColumnDef schema[100];
-    if (load_schema(current_db, query->table_name, schema) == -1) {
-        printf("[-] Error: Table '%s' does not exist.\n", query->table_name);
+    int num_cols = load_schema(current_db, query->table_name, schema);
+    if (num_cols == -1) {
+        sprintf(net_buffer, "ERROR|Table '%s' does not exist in database '%s'.\n", query->table_name, current_db);
+        send(client_sock, net_buffer, strlen(net_buffer), 0);
         return;
     }
 
@@ -235,7 +272,6 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
     
     // 2. Search Tree
     if (btree_search(pager, root_page_id, search_key, &result)) {
-        
         Page* data_page = get_page(pager, result.page_num);
         Slot* slots = (Slot*)data_page->data;
         Slot my_slot = slots[result.slot_num];
@@ -247,17 +283,55 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         memcpy(&header, raw_record, sizeof(TupleHeader));
         
         if (header.expiration_timestamp < (uint64_t)time(NULL)) {
-            printf("[-] Record found, but it has EXPIRED.\n");
+            sprintf(net_buffer, "ERROR|Record found, but it has EXPIRED.\n");
+            send(client_sock, net_buffer, strlen(net_buffer), 0);
         } else {
-            printf("[+] Record Found! Active until timestamp: %lu\n", header.expiration_timestamp);
-            // Future step: deserialize raw_record back into columns here using the schema!
+            // --- BUILD THE MACHINE-READABLE ROW PACKET ---
+            // Format: ROW|num_cols|col1_name|col1_val|col2_name|col2_val\n
+            sprintf(net_buffer, "ROW|%d", num_cols);
+            
+            char temp_str[256];
+            uint16_t offset = sizeof(TupleHeader); 
+
+            for (int i = 0; i < num_cols; i++) {
+                if (strcasecmp(schema[i].type, "INT") == 0) {
+                    int32_t val;
+                    memcpy(&val, raw_record + offset, sizeof(int32_t));
+                    sprintf(temp_str, "|%s|%d", schema[i].name, val);
+                    strcat(net_buffer, temp_str);
+                    offset += sizeof(int32_t);
+                } else if (strcasecmp(schema[i].type, "DECIMAL") == 0) {
+                    double val;
+                    memcpy(&val, raw_record + offset, sizeof(double));
+                    sprintf(temp_str, "|%s|%.2f", schema[i].name, val);
+                    strcat(net_buffer, temp_str);
+                    offset += sizeof(double);
+                } else if (strcasecmp(schema[i].type, "VARCHAR") == 0 || strcasecmp(schema[i].type, "TEXT") == 0) {
+                    uint16_t len;
+                    memcpy(&len, raw_record + offset, sizeof(uint16_t));
+                    offset += sizeof(uint16_t);
+                    char str_val[256] = {0};
+                    memcpy(str_val, raw_record + offset, len);
+                    sprintf(temp_str, "|%s|%s", schema[i].name, str_val);
+                    strcat(net_buffer, temp_str);
+                    offset += len;
+                }
+            }
+            strcat(net_buffer, "\n"); // Cap off the packet with a newline
+
+            // Append the DONE message to the SAME buffer -- to avoid the 40ms OS delay when sending consecutive short packets
+            strcat(net_buffer, "DONE|Query executed successfully.\n");
+            
+            // Send everything in ONE single TCP packet to bypass the 40ms penalty!
+            send(client_sock, net_buffer, strlen(net_buffer), 0);
         }
         
         unpin_page(pager, result.page_num, 0); 
     } else {
-        printf("[-] Record '%s' not found.\n", query->where_value);
+        // If the record isn't found, we just send a DONE message with 0 rows
+        char* done_msg = "DONE|0 rows returned.\n";
+        send(client_sock, done_msg, strlen(done_msg), 0);
     }
 }
-
 
 

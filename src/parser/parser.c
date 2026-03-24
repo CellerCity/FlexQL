@@ -55,7 +55,24 @@ ParsedQuery parse_sql(const char* sql_string) {
     // Syntax: CREATE DATABASE db_name;
     // Syntax: CREATE TABLE table_name (...);
     // =========================================================
-    else if (token && strcasecmp(token, "TABLE") == 0) {
+    else if (strcasecmp(token, "CREATE") == 0) {
+        
+        // Get the next word (should be "DATABASE" or "TABLE")
+        token = strtok(NULL, " \t\n"); 
+        
+        if (token && strcasecmp(token, "DATABASE") == 0) {
+            // It's a CREATE DATABASE command!
+            token = strtok(NULL, " \t\n;");
+            if (token) {
+                query.type = CMD_CREATE_DB;
+                strcpy(query.db_name, token);
+                query.is_valid = 1;
+            } else {
+                strcpy(query.error_msg, "Syntax error: Expected database name.");
+            }
+        } 
+        else if (token && strcasecmp(token, "TABLE") == 0) {
+            // It's a CREATE TABLE command!
             query.type = CMD_CREATE_TABLE;
             token = strtok(NULL, " \t\n(");
             if (token) {
@@ -70,8 +87,8 @@ ParsedQuery parse_sql(const char* sql_string) {
                     strncpy(cols_str, start_paren + 1, len);
                     cols_str[len] = '\0';
                     
-                    int pk_count = 0; // Track Primary Keys
-                    query.is_valid = 1; // Assume valid until proven otherwise
+                    int pk_count = 0; 
+                    query.is_valid = 1; 
                     
                     char *col_token = strtok(cols_str, ",");
                     while (col_token && query.column_count < MAX_COLUMNS && query.is_valid) {
@@ -85,7 +102,6 @@ ParsedQuery parse_sql(const char* sql_string) {
                             strcpy(query.columns[query.column_count].name, word); 
                             word = strtok(NULL, " \t");
                             if (word) {
-                                // --- TYPE VALIDATION ---
                                 if (strcasecmp(word, "INT") != 0 &&
                                     strcasecmp(word, "DECIMAL") != 0 &&
                                     strcasecmp(word, "VARCHAR") != 0 &&
@@ -93,13 +109,13 @@ ParsedQuery parse_sql(const char* sql_string) {
                                     strcasecmp(word, "DATETIME") != 0) {
                                     
                                     snprintf(query.error_msg, sizeof(query.error_msg), 
-                                             "Syntax error: Invalid type '%s'. Must be INT, DECIMAL, VARCHAR, TEXT, or DATETIME.", word);
+                                             "Syntax error: Invalid type '%s'.", word);
                                     query.is_valid = 0;
                                     break;
                                 }
                                 strcpy(query.columns[query.column_count].type, word); 
                                 
-                                // --- CONSTRAINT EXTRACTION ---
+                                // constraints check
                                 while ((word = strtok(NULL, " \t")) != NULL) {
                                     if (strcasecmp(word, "PRIMARY") == 0) {
                                         query.columns[query.column_count].is_primary_key = 1;
@@ -109,16 +125,15 @@ ParsedQuery parse_sql(const char* sql_string) {
                                     }
                                 }
                                 
-                                // --- MULTIPLE PK VALIDATION ---
                                 if (pk_count > 1) {
-                                    strcpy(query.error_msg, "Syntax error: A table can only have one PRIMARY KEY.");
+                                    strcpy(query.error_msg, "Syntax error: Only one PRIMARY KEY allowed.");
                                     query.is_valid = 0;
                                     break;
                                 }
                                 
                                 query.column_count++;
                             } else {
-                                strcpy(query.error_msg, "Syntax error: Missing data type for column.");
+                                strcpy(query.error_msg, "Syntax error: Missing data type.");
                                 query.is_valid = 0;
                                 break;
                             }
@@ -126,11 +141,14 @@ ParsedQuery parse_sql(const char* sql_string) {
                         col_token = strtok(NULL, ",");
                     }
                 } else {
-                    strcpy(query.error_msg, "Syntax error: Missing parentheses in CREATE TABLE.");
+                    strcpy(query.error_msg, "Syntax error: Missing parentheses.");
                     query.is_valid = 0;
                 }
             }
+        } else {
+            strcpy(query.error_msg, "Syntax error: Expected DATABASE or TABLE after CREATE.");
         }
+    }
     // =========================================================
     // 3. DROP COMMANDS
     // Syntax: DROP DATABASE db_name;
@@ -165,6 +183,7 @@ ParsedQuery parse_sql(const char* sql_string) {
     // Syntax: INSERT INTO table_name VALUES (...);
     // =========================================================
     else if (strcasecmp(token, "INSERT") == 0) {
+        query.type = CMD_INSERT;
         token = strtok(NULL, " \t\n");
         if (token && strcasecmp(token, "INTO") == 0) {
             token = strtok(NULL, " \t\n");
