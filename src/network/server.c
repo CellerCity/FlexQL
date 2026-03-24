@@ -22,6 +22,10 @@ void* client_handler(void* socket_desc) {
     uint32_t active_root_page = 0; // This will now safely track the root across queries!
     uint32_t active_data_page = 1; // Track the data page independently (Page 1)
 
+    // THE CACHE PERSISTENCE: Track the active pager across network packets!
+    Pager* active_pager = NULL;
+    char active_table[256] = "";
+
     // Send a generic connection string (This gets cleared by flexql_open's recv call)
     char* welcome = "CONNECTED\n";
     send(client_sock, welcome, strlen(welcome), 0);
@@ -72,22 +76,32 @@ void* client_handler(void* socket_desc) {
             if (strlen(current_db) == 0) {
                 strcpy(response, "ERROR|No database selected. Use 'USE <dbname>;'\n");
             } else {
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, q.table_name);
                 
-                Pager* pager = pager_open(filepath);
+                // --- THE FIX: Smart Pager Reuse ---
+                // If they switch to a different table, flush & close the old one, then open the new one
+                if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
+                    if (active_pager != NULL) {
+                        pager_close(active_pager); // Flush the old table to disk safely
+                    }
+                    
+                    char filepath[512];
+                    snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, q.table_name);
+                    active_pager = pager_open(filepath);
+                    strcpy(active_table, q.table_name);
+                }
+
+
                 
                 if (q.type == CMD_INSERT) {
-                    execute_insert(current_db, pager, &active_root_page, &active_data_page, &q);
+                    execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q);
                 } else if (q.type == CMD_SELECT) {
                     // --- THE CRITICAL CHANGE ---
                     // We tell the server loop NOT to send the default response.
                     // The execute_select function will handle streaming the rows and sending the DONE message.
                     send_default_response = 0; 
-                    execute_select(current_db, pager, active_root_page, &q, client_sock);
+                    execute_select(current_db, active_pager, active_root_page, &q, client_sock);
                 }
                 
-                pager_close(pager);
             }
         } else {
             strcpy(response, "ERROR|Unrecognized command type.\n");
@@ -99,6 +113,12 @@ void* client_handler(void* socket_desc) {
         }
         
         memset(client_message, 0, sizeof(client_message));
+    }
+
+
+    // Graceful Shutdown: If the client disconnects, flush all dirty RAM pages to disk!
+    if (active_pager != NULL) {
+        pager_close(active_pager); 
     }
 
     printf("[Server] Client disconnected.\n");

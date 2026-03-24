@@ -127,7 +127,22 @@ Page* get_page(Pager* pager, uint32_t page_num) {
     // --- CACHE HIT ---
     while (node != NULL) {
         if (node->page_num == page_num) {
-            // Move to tail (MRU) logic here...
+            
+            // --- ACTUAL MRU LOGIC (Move to Tail) ---
+            if (node != pager->tail) {
+                // 1. Disconnect from current position
+                if (node->prev) node->prev->next = node->next;
+                else pager->head = node->next; // It was head
+
+                if (node->next) node->next->prev = node->prev;
+
+                // 2. Attach to tail
+                node->prev = pager->tail;
+                node->next = NULL;
+                if (pager->tail) pager->tail->next = node;
+                pager->tail = node;
+            }
+            // ----------------------------------------
             
             node->pin_count++; // Pin it so the bouncer doesn't grab it
             pthread_mutex_unlock(&pager->global_cache_lock); // Release global lock
