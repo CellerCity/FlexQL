@@ -8,6 +8,7 @@
 void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, IndexKey new_key, RecordID new_record);
 void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id, uint32_t right_page_id, IndexKey key);
 void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id);
+uint32_t find_parent(Pager* pager, uint32_t root_page_id, uint32_t target_page_id);
 
 int compare_keys(IndexKey a, IndexKey b) {
     if (a.type != b.type) return 0; 
@@ -158,7 +159,9 @@ void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, Index
     if (old_node->is_root) {
         create_new_root(pager, root_page_id, old_page_id, new_page_id, middle_key);
     } else {
-        insert_into_internal(pager, root_page_id, old_node->parent_page_id, middle_key, new_page_id);
+        // Dynamically find the TRUE parent, ignoring the ghost pointer!
+        uint32_t true_parent_id = find_parent(pager, *root_page_id, old_page_id);
+        insert_into_internal(pager, root_page_id, true_parent_id, middle_key, new_page_id);
     }
 
     unpin_page(pager, old_page_id, 1);
