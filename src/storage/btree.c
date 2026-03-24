@@ -10,6 +10,32 @@ void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id
 void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id);
 uint32_t find_parent(Pager* pager, uint32_t root_page_id, uint32_t target_page_id);
 
+
+// --- THE BINARY SEARCH OPTIMIZATION ---
+// Drops array traversals from O(N) to O(log N)
+int get_btree_index(BTreeNode* node, IndexKey search_key, int is_internal) {
+    int left = 0;
+    int right = node->num_keys - 1;
+    
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        int cmp = compare_keys(search_key, node->keys[mid]);
+        
+        if (cmp > 0) {
+            left = mid + 1;
+        } else if (cmp < 0) {
+            right = mid - 1;
+        } else {
+            // EXACT MATCH FOUND!
+            // If it's a leaf, we want this exact spot. 
+            // If internal, we want the child pointer just to the right of it.
+            return is_internal ? (mid + 1) : mid;
+        }
+    }
+    return left; 
+}
+
+
 int compare_keys(IndexKey a, IndexKey b) {
     if (a.type != b.type) return 0; 
     switch (a.type) {
@@ -39,10 +65,9 @@ int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, Recor
         BTreeNode* node = (BTreeNode*)(page->data);
 
         if (node->is_leaf) {
-            int i = 0;
-            // LEAF NODE: We want to stop exactly ON the match (> 0)
-            while (i < node->num_keys && compare_keys(search_key, node->keys[i]) > 0) i++;
-
+            // THE FIX: Instant O(log N) lookup for Leaf Nodes
+            int i = get_btree_index(node, search_key, 0);
+            
             if (i < node->num_keys && compare_keys(search_key, node->keys[i]) == 0) {
                 result->page_num = node->payload.leaf_data.records[i].page_num;
                 result->slot_num = node->payload.leaf_data.records[i].slot_num;
@@ -53,9 +78,9 @@ int btree_search(Pager* pager, uint32_t root_page_id, IndexKey search_key, Recor
                 return 0; 
             }
         } else {
-            int i = 0;
-            // INTERNAL NODE: We want to pass the match to take the right child path (>= 0)
-            while (i < node->num_keys && compare_keys(search_key, node->keys[i]) >= 0) i++;
+            // THE FIX: Instant O(log N) lookup for Internal Nodes
+            int i = get_btree_index(node, search_key, 1);
+
             
             uint32_t next_page = node->payload.child_pages[i];
             unpin_page(pager, current_page_id, 0); // Release parent before traversing child
@@ -89,8 +114,9 @@ void btree_insert(Pager* pager, uint32_t* root_page_id, IndexKey key, RecordID r
     }
 
     while (!node->is_leaf) {
-        int i = 0;
-        while (i < node->num_keys && compare_keys(key, node->keys[i]) >= 0) i++;
+        // THE FIX: Instant O(log N) routing during inserts!
+        int i = get_btree_index(node, key, 1);
+
         uint32_t next_page_id = node->payload.child_pages[i];
         
         unpin_page(pager, current_page_id, 0); // Release parent
