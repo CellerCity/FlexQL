@@ -10,6 +10,8 @@
 // The user only sees "FlexQL", but internally we know it holds the network socket.
 struct FlexQL {
     int sockfd;
+    char write_buffer[65536]; // The 64KB Pipeline Buffer
+    int buffer_pos;
 };
 
 // 2. Open Connection
@@ -22,6 +24,9 @@ int flexql_open(const char *host, int port, FlexQL **db) {
         free(*db);
         return FLEXQL_ERROR;
     }
+
+    (*db)->buffer_pos = 0;
+    memset((*db)->write_buffer, 0, sizeof((*db)->write_buffer));
 
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
@@ -50,6 +55,12 @@ int flexql_open(const char *host, int port, FlexQL **db) {
 int flexql_close(FlexQL *db) {
     if (db == NULL) return FLEXQL_ERROR;
     
+    // THE FIX: Flush any remaining buffered queries before shutting down!
+    if (db->buffer_pos > 0) {
+        send(db->sockfd, db->write_buffer, db->buffer_pos, 0);
+        db->buffer_pos = 0;
+    }
+    
     // Send an exit command to cleanly shut down the server thread
     send(db->sockfd, ".exit\n", 6, 0); 
     close(db->sockfd);
@@ -59,26 +70,51 @@ int flexql_close(FlexQL *db) {
 }
 
 // 4. Execute Query & Stream Results
+// 4. Execute Query & Stream Results
 int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**, char**), void *arg, char **errmsg) {
     if (db == NULL) return FLEXQL_ERROR;
     if (errmsg) *errmsg = NULL;
 
-    // We explicitly add a newline delimiter to every query!
+    // =========================================================
+    // THE PIPELINING MAGIC (FIRE AND FORGET)
+    // =========================================================
+    // Is it an INSERT query? Buffer it!
+    if (strncasecmp(sql, "INSERT", 6) == 0) {
+        int sql_len = strlen(sql);
+        
+        // If the buffer is about to overflow, flush it to the server!
+        if (db->buffer_pos + sql_len + 2 >= sizeof(db->write_buffer)) {
+            send(db->sockfd, db->write_buffer, db->buffer_pos, 0);
+            db->buffer_pos = 0; 
+            memset(db->write_buffer, 0, sizeof(db->write_buffer));
+        }
+
+        // Add the query and a newline to the buffer
+        strcpy(db->write_buffer + db->buffer_pos, sql);
+        db->buffer_pos += sql_len;
+        db->write_buffer[db->buffer_pos] = '\n';
+        db->buffer_pos++;
+
+        return FLEXQL_OK; // Fire and forget!
+    }
+
+    // =========================================================
+    // If it is NOT an insert (e.g., SELECT, CREATE), we MUST 
+    // flush the buffer first so the server has all the data!
+    // =========================================================
+    if (db->buffer_pos > 0) {
+        send(db->sockfd, db->write_buffer, db->buffer_pos, 0);
+        db->buffer_pos = 0;
+        memset(db->write_buffer, 0, sizeof(db->write_buffer));
+    }
+
+    // --- NOW we send the actual SELECT/CREATE query ---
     char network_query[2048];
     snprintf(network_query, sizeof(network_query), "%s\n", sql);
 
     if (send(db->sockfd, network_query, strlen(network_query), 0) < 0) {
         if (errmsg) *errmsg = strdup("Network error: Failed to send query.");
         return FLEXQL_ERROR;
-    }
-
-    // =========================================================
-    // THE PIPELINING MAGIC (FIRE AND FORGET)
-    // If it's an INSERT, we assume success and instantly return.
-    // The OS will automatically batch these in the TCP buffer!
-    // =========================================================
-    if (strncasecmp(sql, "INSERT", 6) == 0) {
-        return FLEXQL_OK; 
     }
 
     char buffer[4096];
@@ -126,13 +162,13 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
                             values[i] = strtok_r(NULL, "|", &saveptr_col);
                         }
                         
-                        // FIRE THE CALLBACK! [cite: 139]
+                        // FIRE THE CALLBACK!
                         int abort_flag = callback(arg, col_count, values, colNames);
                         
                         free(colNames);
                         free(values);
                         
-                        // If callback returns 1, the user wants to abort [cite: 148, 149]
+                        // If callback returns 1, the user wants to abort
                         if (abort_flag == 1) {
                             return FLEXQL_OK; 
                         }
@@ -154,6 +190,8 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
     }
     return FLEXQL_OK;
 }
+
+
 
 // 5. Free Memory
 void flexql_free(void *ptr) {
