@@ -17,114 +17,125 @@ void* client_handler(void* socket_desc) {
     int client_sock = *(int*)socket_desc;
     free(socket_desc); 
 
-    char client_message[2048];
-    char current_db[MAX_DB_NAME_LEN] = "";
-    uint32_t active_root_page = 0; // This will now safely track the root across queries!
-    uint32_t active_data_page = 1; // Track the data page independently (Page 1)
-
-    // THE CACHE PERSISTENCE: Track the active pager across network packets!
+    char current_db[MAX_DB_NAME_LEN] = ""; 
+    uint32_t active_root_page = 0; 
+    uint32_t active_data_page = 1; 
     Pager* active_pager = NULL;
     char active_table[256] = "";
 
-    // Send a generic connection string (This gets cleared by flexql_open's recv call)
+    // Send a generic connection string
     char* welcome = "CONNECTED\n";
     send(client_sock, welcome, strlen(welcome), 0);
 
-    while (recv(client_sock, client_message, sizeof(client_message), 0) > 0) {
+    // --- THE STREAM BUFFER ---
+    // This holds leftover data if a TCP packet cuts a query in half
+    char stream_buffer[65536] = ""; 
+    char read_buffer[8192];
+
+    while (recv(client_sock, read_buffer, sizeof(read_buffer) - 1, 0) > 0) {
+        read_buffer[sizeof(read_buffer) - 1] = '\0'; // Safety null termination
         
-        client_message[strcspn(client_message, "\r\n")] = 0;
+        // Append newly received raw bytes to the master stream buffer
+        strcat(stream_buffer, read_buffer);
 
-        // Ignore empty messages
-        if (strlen(client_message) == 0) continue;
-
-        // Handle the silent disconnect from the driver
-        if (strcmp(client_message, ".exit") == 0) break;
-
-        // printf("\n[Server] Received query: %s\n", client_message); // COMMENT THIS -> this takes a lot of time
-
-        ParsedQuery q = parse_sql(client_message);
-
-        if (!q.is_valid) {
-            char error_response[512];
-            // Format as an ERROR string
-            snprintf(error_response, sizeof(error_response), "ERROR|Syntax Error: %s\n", q.error_msg);
-            send(client_sock, error_response, strlen(error_response), 0);
-            memset(client_message, 0, sizeof(client_message));
-            continue;
-        }
-
-        // Default success response
-        char response[512] = "DONE|Query executed successfully.\n";
-        int send_default_response = 1; // Flag to check if we need to send the default response
-
-        if (q.type == CMD_CREATE_DB) {
-            if (execute_create_db(&q) != 0) {
-                strcpy(response, "ERROR|Failed to create database (it may already exist).\n");
-            }
-        } else if (q.type == CMD_USE_DB) {
-            if (execute_use_db(&q, current_db) != 0) {
-                strcpy(response, "ERROR|Database does not exist.\n");
-            }
-        } else if (q.type == CMD_DROP_DB) {
-            execute_drop_db(&q, current_db);
-        } else if (q.type == CMD_CREATE_TABLE) {
-            execute_create(current_db, &q);
-        } else if (q.type == CMD_DROP_TABLE) {
-            execute_drop_table(current_db, &q);
-        } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
+        // --- THE LINE READER ---
+        // Process every complete line found in the stream buffer!
+        char *newline_ptr;
+        while ((newline_ptr = strchr(stream_buffer, '\n')) != NULL) {
             
-            if (strlen(current_db) == 0) {
-                strcpy(response, "ERROR|No database selected. Use 'USE <dbname>;'\n");
-            } else {
+            *newline_ptr = '\0'; // Split the string at the newline
+            
+            char client_message[2048];
+            strcpy(client_message, stream_buffer); // Extract the single query
+
+            // Shift the rest of the stream buffer to the left
+            memmove(stream_buffer, newline_ptr + 1, strlen(newline_ptr + 1) + 1);
+
+            // Clean up carriage returns just in case
+            client_message[strcspn(client_message, "\r")] = 0;
+            if (strlen(client_message) == 0) continue;
+            if (strcmp(client_message, ".exit") == 0) goto graceful_shutdown;
+
+            ParsedQuery q = parse_sql(client_message);
+
+            if (!q.is_valid) {
+                char error_response[512];
+                // Format as an ERROR string
+                snprintf(error_response, sizeof(error_response), "ERROR|Syntax Error: %s\n", q.error_msg);
+                send(client_sock, error_response, strlen(error_response), 0);
+                memset(client_message, 0, sizeof(client_message));
+                continue;
+            }
+
+            char response[512] = "DONE|Query executed successfully.\n";
+            int send_default_response = 1;        
+
+            if (q.type == CMD_CREATE_DB) {
+                if (execute_create_db(&q) != 0) {
+                    strcpy(response, "ERROR|Failed to create database (it may already exist).\n");
+                }
+            } else if (q.type == CMD_USE_DB) {
+                if (execute_use_db(&q, current_db) != 0) {
+                    strcpy(response, "ERROR|Database does not exist.\n");
+                }
+            } else if (q.type == CMD_DROP_DB) {
+                execute_drop_db(&q, current_db);
+            } else if (q.type == CMD_CREATE_TABLE) {
+                execute_create(current_db, &q);
+            } else if (q.type == CMD_DROP_TABLE) {
+                execute_drop_table(current_db, &q);
+            } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
                 
-                // --- THE FIX: Smart Pager Reuse ---
-                // If they switch to a different table, flush & close the old one, then open the new one
-                if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
-                    if (active_pager != NULL) {
-                        pager_close(active_pager); // Flush the old table to disk safely
+                if (strlen(current_db) == 0) {
+                    strcpy(response, "ERROR|No database selected. Use 'USE <dbname>;'\n");
+                } else if (strlen(current_db) > 0) {
+                    
+                    // --- THE FIX: Smart Pager Reuse ---
+                    // If they switch to a different table, flush & close the old one, then open the new one
+                    if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
+                        if (active_pager != NULL) {
+                            pager_close(active_pager); // Flush the old table to disk safely
+                        }
+                        
+                        char filepath[512];
+                        snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, q.table_name);
+                        active_pager = pager_open(filepath);
+                        strcpy(active_table, q.table_name);
                     }
                     
-                    char filepath[512];
-                    snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, q.table_name);
-                    active_pager = pager_open(filepath);
-                    strcpy(active_table, q.table_name);
+                    if (q.type == CMD_INSERT) {
+                        execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q);
+                        
+                        // CRITICAL PIPELINE FIX: Do NOT send a response back for inserts!
+                        send_default_response = 0;
+                    } else if (q.type == CMD_SELECT) {
+                        // --- THE CRITICAL CHANGE ---
+                        // We tell the server loop NOT to send the default response.
+                        // The execute_select function will handle streaming the rows and sending the DONE message.
+                        send_default_response = 0; 
+                        execute_select(current_db, active_pager, active_root_page, &q, client_sock);
+                    }
+                    
                 }
-
-
-                
-                if (q.type == CMD_INSERT) {
-                    execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q);
-                } else if (q.type == CMD_SELECT) {
-                    // --- THE CRITICAL CHANGE ---
-                    // We tell the server loop NOT to send the default response.
-                    // The execute_select function will handle streaming the rows and sending the DONE message.
-                    send_default_response = 0; 
-                    execute_select(current_db, active_pager, active_root_page, &q, client_sock);
-                }
-                
+            } else {
+                strcpy(response, "ERROR|Unrecognized command type.\n");
             }
-        } else {
-            strcpy(response, "ERROR|Unrecognized command type.\n");
-        }
 
         // Send confirmation back to the client if it wasn't a SELECT query
-        if (send_default_response) {
-            send(client_sock, response, strlen(response), 0);
+            if (send_default_response) {
+                send(client_sock, response, strlen(response), 0);
+            }
         }
-        
-        memset(client_message, 0, sizeof(client_message));
+
+        memset(read_buffer, 0, sizeof(read_buffer));
     }
-
-
-    // Graceful Shutdown: If the client disconnects, flush all dirty RAM pages to disk!
-    if (active_pager != NULL) {
-        pager_close(active_pager); 
-    }
-
-    printf("[Server] Client disconnected.\n");
-    close(client_sock);
-    return NULL;
+    graceful_shutdown:
+        if (active_pager != NULL) pager_close(active_pager); 
+        printf("[Server] Client disconnected.\n");
+        close(client_sock);
+        return NULL;
 }
+
 
 int main() {
     int server_socket, client_socket;

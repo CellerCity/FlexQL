@@ -63,10 +63,22 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
     if (db == NULL) return FLEXQL_ERROR;
     if (errmsg) *errmsg = NULL;
 
-    // Send the query to the server
-    if (send(db->sockfd, sql, strlen(sql), 0) < 0) {
+    // We explicitly add a newline delimiter to every query!
+    char network_query[2048];
+    snprintf(network_query, sizeof(network_query), "%s\n", sql);
+
+    if (send(db->sockfd, network_query, strlen(network_query), 0) < 0) {
         if (errmsg) *errmsg = strdup("Network error: Failed to send query.");
         return FLEXQL_ERROR;
+    }
+
+    // =========================================================
+    // THE PIPELINING MAGIC (FIRE AND FORGET)
+    // If it's an INSERT, we assume success and instantly return.
+    // The OS will automatically batch these in the TCP buffer!
+    // =========================================================
+    if (strncasecmp(sql, "INSERT", 6) == 0) {
+        return FLEXQL_OK; 
     }
 
     char buffer[4096];
