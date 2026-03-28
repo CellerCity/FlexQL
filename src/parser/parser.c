@@ -130,23 +130,28 @@ ParsedQuery parse_sql(const char* sql_string) {
                     int pk_count = 0; 
                     query.is_valid = 1; 
                     
-                    char *col_token = strtok(cols_str, ",");
+                    // --- THE BUG FIX: Use strtok_r for nested loops! ---
+                    char *saveptr_comma;
+                    char *col_token = strtok_r(cols_str, ",", &saveptr_comma);
+                    
                     while (col_token && query.column_count < MAX_COLUMNS && query.is_valid) {
                         trim_string(col_token);
                         
                         char col_copy[128];
                         strncpy(col_copy, col_token, sizeof(col_copy)-1);
+                        col_copy[sizeof(col_copy)-1] = '\0'; // Ensure safety
                         
-                        char *word = strtok(col_copy, " \t");
+                        char *saveptr_space;
+                        char *word = strtok_r(col_copy, " \t", &saveptr_space);
                         if (word) {
                             strcpy(query.columns[query.column_count].name, word); 
-                            word = strtok(NULL, " \t");
+                            word = strtok_r(NULL, " \t", &saveptr_space);
+                            
                             if (word) {
-                                
-                                // --- TRAP 2: Use strncasecmp for VARCHAR(64) ---
+                                // Type Validation
                                 if (strcasecmp(word, "INT") != 0 &&
                                     strcasecmp(word, "DECIMAL") != 0 &&
-                                    strncasecmp(word, "VARCHAR", 7) != 0 && // Only check the first 7 letters!
+                                    strncasecmp(word, "VARCHAR", 7) != 0 && 
                                     strcasecmp(word, "TEXT") != 0 && 
                                     strcasecmp(word, "DATETIME") != 0) {
                                     
@@ -155,14 +160,14 @@ ParsedQuery parse_sql(const char* sql_string) {
                                     break;
                                 }
                                 
-                                // Force it to save as exactly "VARCHAR" to keep our Executor fast!
+                                // Standardize VARCHAR
                                 if (strncasecmp(word, "VARCHAR", 7) == 0) {
                                     strcpy(query.columns[query.column_count].type, "VARCHAR");
                                 } else {
                                     strcpy(query.columns[query.column_count].type, word); 
                                 }
                                 
-                                while ((word = strtok(NULL, " \t")) != NULL) {
+                                while ((word = strtok_r(NULL, " \t", &saveptr_space)) != NULL) {
                                     if (strcasecmp(word, "PRIMARY") == 0) {
                                         query.columns[query.column_count].is_primary_key = 1;
                                         pk_count++;
@@ -184,7 +189,7 @@ ParsedQuery parse_sql(const char* sql_string) {
                                 break;
                             }
                         }
-                        col_token = strtok(NULL, ",");
+                        col_token = strtok_r(NULL, ",", &saveptr_comma);
                     }
                 } else {
                     strcpy(query.error_msg, "Syntax error: Missing parentheses.");

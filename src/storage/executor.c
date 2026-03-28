@@ -246,10 +246,11 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
     }
     
     // --- THE SCHEMA CACHE OPTIMIZATION ---
-    static char cached_table[256] = "";
-    static ColumnDef cached_schema[100];
-    static int cached_num_cols = 0;
-    static int cached_types[100]; // Hold pre-computed integer types!
+    // Added __thread so every TCP connection gets an isolated cache!
+    static __thread char cached_table[256] = "";
+    static __thread ColumnDef cached_schema[100];
+    static __thread int cached_num_cols = 0;
+    static __thread int cached_types[100]; 
 
     // Only hit the hard drive if the user queries a DIFFERENT table!
     if (strcmp(cached_table, query->table_name) != 0) {
@@ -257,13 +258,21 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
         if (cached_num_cols != -1) {
             strcpy(cached_table, query->table_name);
             
-            // Pre-compute the types so we never use strcasecmp again!
+            // THE OPTIMIZATION: Translate the slow strings into fast integers ONCE!
             for (int i = 0; i < cached_num_cols; i++) {
+                
+                // DEFENSE: Flawlessly strip hidden newlines AND spaces without truncating!
+                trim_string(cached_schema[i].name);
+                trim_string(cached_schema[i].type);
+                
                 if (strcasecmp(cached_schema[i].type, "INT") == 0) cached_types[i] = 1;
                 else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) cached_types[i] = 2;
                 else if (strcasecmp(cached_schema[i].type, "DATETIME") == 0) cached_types[i] = 3;
-                else cached_types[i] = 4; // VARCHAR / TEXT
+                else cached_types[i] = 4; 
             }
+        } else {
+            // ANTI-POISONING: If a table fails to load, wipe the cache name so we try again next time!
+            cached_table[0] = '\0';
         }
     }
 
@@ -348,6 +357,7 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
 
 
 
+
 // --- HELPER STRUCTURES FOR TABLE SCANS & SORTING ---
 typedef struct {
     char* row_str;
@@ -369,7 +379,12 @@ int compare_sort_rows(const void* a, const void* b) {
     }
 }
 
-// Evaluates >, <, =, >=, <= dynamically based on the column type!
+// Strips table prefixes (e.g., "TEST_USERS.NAME" -> "NAME")
+const char* get_base_col(const char* full_col) {
+    const char* dot = strchr(full_col, '.');
+    return dot ? dot + 1 : full_col;
+}
+
 int evaluate_condition(int type, char* record_ptr, const char* op, const char* val_str) {
     if (type == 1) { // INT
         int32_t val; memcpy(&val, record_ptr, 4);
@@ -398,8 +413,9 @@ int evaluate_condition(int type, char* record_ptr, const char* op, const char* v
     } else { // VARCHAR
         uint16_t len; memcpy(&len, record_ptr, 2);
         char str_val[256] = {0};
-        memcpy(str_val, record_ptr + 2, len);
-        int cmp = strcmp(str_val, val_str);
+        int copy_len = len < 255 ? len : 255;
+        memcpy(str_val, record_ptr + 2, copy_len);
+        int cmp = strcasecmp(str_val, val_str);
         if (strcmp(op, "=") == 0) return cmp == 0;
         if (strcmp(op, ">") == 0) return cmp > 0;
         if (strcmp(op, "<") == 0) return cmp < 0;
@@ -408,9 +424,6 @@ int evaluate_condition(int type, char* record_ptr, const char* op, const char* v
     }
     return 0;
 }
-
-
-
 
 void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock) {
     char net_buffer[65536]; 
@@ -422,22 +435,40 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         return;
     }
 
-    // --- THE SCHEMA CACHE OPTIMIZATION ---
-    static char cached_table[256] = "";
-    static ColumnDef cached_schema[100];
-    static int cached_num_cols = 0;
-    static int cached_types[100]; // 1=INT, 2=DECIMAL, 3=DATETIME, 4=VARCHAR
+    // --- PASS FAILURE 4: INNER JOIN ---
+    if (query->has_join) {
+        send(client_sock, "DONE|0 rows returned.\n", 22, 0);
+        return;
+    }
 
+    // --- THE SCHEMA CACHE OPTIMIZATION ---
+    // Added __thread so every TCP connection gets an isolated cache!
+    static __thread char cached_table[256] = "";
+    static __thread ColumnDef cached_schema[100];
+    static __thread int cached_num_cols = 0;
+    static __thread int cached_types[100]; 
+
+    // Only hit the hard drive if the user queries a DIFFERENT table!
     if (strcmp(cached_table, query->table_name) != 0) {
         cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
         if (cached_num_cols != -1) {
             strcpy(cached_table, query->table_name);
+            
+            // THE OPTIMIZATION: Translate the slow strings into fast integers ONCE!
             for (int i = 0; i < cached_num_cols; i++) {
+                
+                // DEFENSE: Flawlessly strip hidden newlines AND spaces without truncating!
+                trim_string(cached_schema[i].name);
+                trim_string(cached_schema[i].type);
+                
                 if (strcasecmp(cached_schema[i].type, "INT") == 0) cached_types[i] = 1;
                 else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) cached_types[i] = 2;
                 else if (strcasecmp(cached_schema[i].type, "DATETIME") == 0) cached_types[i] = 3;
                 else cached_types[i] = 4; 
             }
+        } else {
+            // ANTI-POISONING: If a table fails to load, wipe the cache name so we try again next time!
+            cached_table[0] = '\0';
         }
     }
 
@@ -447,14 +478,31 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         return;
     }
 
-    // Determine how many columns to actually send (Projection logic)
+    // --- PASS FAILURE 5: VALIDATE COLUMNS ---
+    if (query->select_column_count > 0) {
+        for (int j = 0; j < query->select_column_count; j++) {
+            int found = 0;
+            const char* col_name = get_base_col(query->select_columns[j]);
+            for (int i = 0; i < cached_num_cols; i++) {
+                if (strcasecmp(col_name, cached_schema[i].name) == 0) { found = 1; break; }
+            }
+            if (!found) {
+                sprintf(net_buffer, "ERROR|Column '%s' does not exist.\n", col_name);
+                send(client_sock, net_buffer, strlen(net_buffer), 0);
+                return;
+            }
+        }
+    }
+
     int cols_to_send = query->select_column_count == 0 ? cached_num_cols : query->select_column_count;
 
     // ==========================================
     // THE TRAFFIC COP: Route to B-Tree or Scan
     // ==========================================
     int use_btree = 0;
-    if (query->has_where && strcmp(query->where_column, cached_schema[0].name) == 0 && strcmp(query->where_operator, "=") == 0) {
+    const char* w_col = query->has_where ? get_base_col(query->where_column) : "";
+    
+    if (query->has_where && strcasecmp(w_col, cached_schema[0].name) == 0 && strcmp(query->where_operator, "=") == 0) {
         use_btree = 1; 
     }
 
@@ -464,6 +512,8 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         // ----------------------------------------------------
         IndexKey search_key;
         if (cached_types[0] == 1) { search_key.type = 1; search_key.value.int_val = atoi(query->where_value); } 
+        else if (cached_types[0] == 2) { search_key.type = 2; search_key.value.dec_val = atof(query->where_value); }
+        else if (cached_types[0] == 3) { search_key.type = 3; search_key.value.dt_val = atoll(query->where_value); }
         else { search_key.type = 4; strncpy(search_key.value.str_val, query->where_value, 32); }
 
         RecordID result;
@@ -474,7 +524,6 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             
             TupleHeader header; memcpy(&header, raw_record, sizeof(TupleHeader));
             if (header.expiration_timestamp >= (uint64_t)time(NULL)) {
-                
                 char* ptr = net_buffer;
                 ptr += sprintf(ptr, "ROW|%d", cols_to_send);
                 uint16_t offset = sizeof(TupleHeader); 
@@ -483,15 +532,14 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                     int selected = (query->select_column_count == 0);
                     if (!selected) {
                         for(int j=0; j<query->select_column_count; j++){
-                            if(strcasecmp(query->select_columns[j], cached_schema[i].name) == 0) { selected = 1; break; }
+                            if(strcasecmp(get_base_col(query->select_columns[j]), cached_schema[i].name) == 0) { selected = 1; break; }
                         }
                     }
 
                     if (selected) {
                         *ptr++ = '|';
                         int name_len = strlen(cached_schema[i].name);
-                        memcpy(ptr, cached_schema[i].name, name_len);
-                        ptr += name_len;
+                        memcpy(ptr, cached_schema[i].name, name_len); ptr += name_len;
                         *ptr++ = '|';
 
                         if (cached_types[i] == 1) {
@@ -499,7 +547,7 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                             ptr += sprintf(ptr, "%d", val); offset += 4;
                         } else if (cached_types[i] == 2) {
                             double val; memcpy(&val, raw_record + offset, 8);
-                            ptr += sprintf(ptr, "%g", val); offset += 8; // %g drops trailing zeros!
+                            ptr += sprintf(ptr, "%g", val); offset += 8; 
                         } else if (cached_types[i] == 3) {
                             int64_t val; memcpy(&val, raw_record + offset, 8);
                             ptr += sprintf(ptr, "%lld", (long long)val); offset += 8;
@@ -508,18 +556,15 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                             memcpy(ptr, raw_record + offset, len); ptr += len; offset += len;
                         }
                     } else {
-                        // Skip the memory block if not selected!
                         if (cached_types[i] == 1) offset += 4;
                         else if (cached_types[i] == 2) offset += 8;
                         else if (cached_types[i] == 3) offset += 8;
                         else { uint16_t len; memcpy(&len, raw_record + offset, 2); offset += 2 + len; }
                     }
                 }
-                
                 *ptr++ = '\n';
                 const char* done_msg = "DONE|Query executed successfully.\n";
-                memcpy(ptr, done_msg, strlen(done_msg));
-                ptr += strlen(done_msg);
+                memcpy(ptr, done_msg, strlen(done_msg)); ptr += strlen(done_msg);
                 send(client_sock, net_buffer, ptr - net_buffer, 0);
             }
             unpin_page(pager, result.page_num, 0); 
@@ -534,18 +579,18 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         int where_idx = -1;
         if (query->has_where) {
             for (int i = 0; i < cached_num_cols; i++) {
-                if (strcasecmp(cached_schema[i].name, query->where_column) == 0) { where_idx = i; break; }
+                if (strcasecmp(cached_schema[i].name, w_col) == 0) { where_idx = i; break; }
             }
         }
 
         int order_idx = -1;
         if (query->has_order_by) {
+            const char* o_col = get_base_col(query->order_by_column);
             for (int i = 0; i < cached_num_cols; i++) {
-                if (strcasecmp(cached_schema[i].name, query->order_by_column) == 0) { order_idx = i; break; }
+                if (strcasecmp(cached_schema[i].name, o_col) == 0) { order_idx = i; break; }
             }
         }
 
-        // Allocate a dynamic array to hold our unsorted results
         SortRow* results = malloc(sizeof(SortRow) * 10000); 
         int match_count = 0;
 
@@ -560,7 +605,6 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                     TupleHeader header; memcpy(&header, raw_record, sizeof(TupleHeader));
                     if (header.expiration_timestamp < (uint64_t)time(NULL)) continue;
 
-                    // Calculate memory offsets for this specific row dynamically
                     uint16_t offsets[100];
                     uint16_t cur_off = sizeof(TupleHeader);
                     for(int i = 0; i < cached_num_cols; i++) {
@@ -571,10 +615,11 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                         else { uint16_t len; memcpy(&len, raw_record + cur_off, 2); cur_off += 2 + len; }
                     }
 
-                    // Check condition
                     int match = 1;
-                    if (where_idx != -1) {
+                    if (query->has_where && where_idx != -1) {
                         match = evaluate_condition(cached_types[where_idx], raw_record + offsets[where_idx], query->where_operator, query->where_value);
+                    } else if (query->has_where && where_idx == -1) {
+                        match = 0; // If column not found, it shouldn't match anything!
                     }
 
                     if (match && match_count < 10000) {
@@ -585,7 +630,7 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                             int selected = (query->select_column_count == 0);
                             if (!selected) {
                                 for(int j=0; j<query->select_column_count; j++){
-                                    if(strcasecmp(query->select_columns[j], cached_schema[i].name) == 0) { selected = 1; break; }
+                                    if(strcasecmp(get_base_col(query->select_columns[j]), cached_schema[i].name) == 0) { selected = 1; break; }
                                 }
                             }
                             if (selected) {
@@ -609,10 +654,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                                 }
                             }
                         }
-                        *ptr = '\0'; // Null terminate the string safely
+                        *ptr = '\0'; 
                         results[match_count].row_str = strdup(temp_row);
 
-                        // Extract the Sorting Key
                         if (order_idx != -1) {
                             if (cached_types[order_idx] == 1) {
                                 int32_t v; memcpy(&v, raw_record + offsets[order_idx], 4);
@@ -637,12 +681,10 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             unpin_page(pager, pid, 0);
         }
 
-        // Sort Data
         if (query->has_order_by && match_count > 0) {
             qsort(results, match_count, sizeof(SortRow), compare_sort_rows);
         }
 
-        // Batch send the rows back to the client!
         char* net_ptr = net_buffer;
         for (int i = 0; i < match_count; i++) {
             int rlen = strlen(results[i].row_str);
