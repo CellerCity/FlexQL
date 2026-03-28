@@ -10,7 +10,7 @@
 #include "../parser/parser.h" 
 #include <sys/stat.h>  // For mkdir() and stat()
 #include <sys/types.h>
-
+#include <sys/socket.h>
 
 extern void trim_string(char *str);
 
@@ -73,6 +73,34 @@ void execute_drop_db(ParsedQuery* query, char* current_db_session) {
         current_db_session[0] = '\0'; // Empty the string
         printf("[!] You are no longer using any database.\n");
     }
+}
+
+void execute_delete(const char* current_db, ParsedQuery* query) {
+    if (strlen(current_db) == 0) {
+        printf("[-] Error: No database selected.\n");
+        return;
+    }
+
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, query->table_name);
+    
+    // 1. Delete the old data file from the hard drive
+    remove(filepath);
+    
+    // 2. Re-initialize a fresh, empty B+ Tree Root Page!
+    Pager* pager = pager_open(filepath);
+    Page* root_page = get_page(pager, 0);
+    
+    root_page->header.page_type = 1; // Mark as Index Page
+    BTreeNode* root_node = (BTreeNode*)root_page->data;
+    root_node->is_leaf = 1;
+    root_node->is_root = 1;
+    root_node->num_keys = 0;
+    
+    unpin_page(pager, 0, 1); // Save the new root to disk
+    pager_close(pager);
+    
+    printf("[+] All records deleted from table '%s'.\n", query->table_name);
 }
 
 

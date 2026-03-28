@@ -59,16 +59,13 @@ ParsedQuery parse_sql(const char* sql_string) {
     // Make a working copy of the string (strtok modifies the original)
     // Dynamic allocation to prevent stack overflow!
     char* sql_copy = strdup(sql_string);
-    char *token = strtok(sql_copy, " \t\n");
-        
 
-    strncpy(sql_copy, sql_string, sizeof(sql_copy) - 1);
-    sql_copy[sizeof(sql_copy) - 1] = '\0';
 
     // Extract the first keyword
     char *token = strtok(sql_copy, " \t\n");
     if (!token) {
         strcpy(query.error_msg, "Empty query.");
+        free(sql_copy);
         return query;
     }
 
@@ -108,9 +105,16 @@ ParsedQuery parse_sql(const char* sql_string) {
             }
         } 
         else if (token && strcasecmp(token, "TABLE") == 0) {
-            // It's a CREATE TABLE command!
             query.type = CMD_CREATE_TABLE;
+            
+            // --- TRAP 1: Bypass "IF NOT EXISTS" ---
             token = strtok(NULL, " \t\n(");
+            if (token && strcasecmp(token, "IF") == 0) {
+                strtok(NULL, " \t\n"); // skip "NOT"
+                strtok(NULL, " \t\n"); // skip "EXISTS"
+                token = strtok(NULL, " \t\n("); // Get the actual table name
+            }
+
             if (token) {
                 strcpy(query.table_name, token);
                 
@@ -138,20 +142,26 @@ ParsedQuery parse_sql(const char* sql_string) {
                             strcpy(query.columns[query.column_count].name, word); 
                             word = strtok(NULL, " \t");
                             if (word) {
+                                
+                                // --- TRAP 2: Use strncasecmp for VARCHAR(64) ---
                                 if (strcasecmp(word, "INT") != 0 &&
                                     strcasecmp(word, "DECIMAL") != 0 &&
-                                    strcasecmp(word, "VARCHAR") != 0 &&
+                                    strncasecmp(word, "VARCHAR", 7) != 0 && // Only check the first 7 letters!
                                     strcasecmp(word, "TEXT") != 0 && 
                                     strcasecmp(word, "DATETIME") != 0) {
                                     
-                                    snprintf(query.error_msg, sizeof(query.error_msg), 
-                                             "Syntax error: Invalid type '%s'.", word);
+                                    snprintf(query.error_msg, sizeof(query.error_msg), "Syntax error: Invalid type '%s'.", word);
                                     query.is_valid = 0;
                                     break;
                                 }
-                                strcpy(query.columns[query.column_count].type, word); 
                                 
-                                // constraints check
+                                // Force it to save as exactly "VARCHAR" to keep our Executor fast!
+                                if (strncasecmp(word, "VARCHAR", 7) == 0) {
+                                    strcpy(query.columns[query.column_count].type, "VARCHAR");
+                                } else {
+                                    strcpy(query.columns[query.column_count].type, word); 
+                                }
+                                
                                 while ((word = strtok(NULL, " \t")) != NULL) {
                                     if (strcasecmp(word, "PRIMARY") == 0) {
                                         query.columns[query.column_count].is_primary_key = 1;
@@ -216,10 +226,6 @@ ParsedQuery parse_sql(const char* sql_string) {
     }
     // =========================================================
     // 4. INSERT COMMAND
-    // Syntax: INSERT INTO table_name VALUES (...);
-    // =========================================================
-    // =========================================================
-    // 4. INSERT COMMAND
     // Syntax: INSERT INTO table_name VALUES (...), (...);
     // =========================================================
     else if (strcasecmp(token, "INSERT") == 0) {
@@ -237,9 +243,6 @@ ParsedQuery parse_sql(const char* sql_string) {
 
                     // --- BULK INSERT OPTIMIZATION ---
                     // Find the very first '(' in the raw, unmodified SQL string
-                    const char *start_paren = strchr(sql_string, '(');
-                    
-                    // --- BULK INSERT OPTIMIZATION & VALIDATION ---
                     const char *start_paren = strchr(sql_string, '(');
                     
                     if (start_paren) {
@@ -294,7 +297,26 @@ ParsedQuery parse_sql(const char* sql_string) {
              query.is_valid = 0;
         }
     }
-
+    // =========================================================
+    // 4.5 DELETE COMMAND (TRUNCATE)
+    // Syntax: DELETE FROM table_name;
+    // =========================================================
+    else if (strcasecmp(token, "DELETE") == 0) {
+        query.type = CMD_DELETE;
+        token = strtok(NULL, " \t\n"); // Should be "FROM"
+        
+        if (token && strcasecmp(token, "FROM") == 0) {
+            token = strtok(NULL, " \t\n;"); // Should be table_name
+            if (token) {
+                strcpy(query.table_name, token);
+                query.is_valid = 1;
+            } else {
+                strcpy(query.error_msg, "Syntax error: Expected table name after FROM.");
+            }
+        } else {
+            strcpy(query.error_msg, "Syntax error: Expected FROM after DELETE.");
+        }
+    }
     // =========================================================
     // 5. SELECT COMMAND
     // Syntax: SELECT col1, col2 FROM tableA [INNER JOIN tableB ON A.c1 = B.c2] [WHERE col = val];

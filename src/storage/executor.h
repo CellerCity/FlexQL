@@ -16,5 +16,7 @@ void execute_drop_table(const char* current_db, ParsedQuery* query);
 // Row operations// Update the execute_insert signature
 void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id, uint32_t* active_data_page, ParsedQuery* query);
 void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock);
+void execute_delete(const char* current_db, ParsedQuery* query);
+
 
 #endif

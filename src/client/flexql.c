@@ -96,7 +96,7 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
                 send(db->sockfd, db->write_buffer, db->buffer_pos, 0);
                 db->buffer_pos = 0;
             }
-            char* huge_query = malloc(sql_len + 2);
+            char* huge_query = (char*)malloc(sql_len + 2);
             sprintf(huge_query, "%s\n", sql);
             send(db->sockfd, huge_query, sql_len + 1, 0);
             free(huge_query);

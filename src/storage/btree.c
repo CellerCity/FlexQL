@@ -9,7 +9,7 @@ void split_leaf_node(Pager* pager, uint32_t* root_page_id, Page* old_page, Index
 void create_new_root(Pager* pager, uint32_t* root_page_id, uint32_t left_page_id, uint32_t right_page_id, IndexKey key);
 void insert_into_internal(Pager* pager, uint32_t* root_page_id, uint32_t parent_page_id, IndexKey key, uint32_t right_child_page_id);
 uint32_t find_parent(Pager* pager, uint32_t root_page_id, uint32_t target_page_id);
-
+int compare_keys(IndexKey a, IndexKey b);
 
 // --- THE BINARY SEARCH OPTIMIZATION ---
 // Drops array traversals from O(N) to O(log N)

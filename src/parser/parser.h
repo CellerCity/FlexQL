@@ -20,7 +20,8 @@ typedef enum {
     CMD_CREATE_TABLE,    
     CMD_DROP_TABLE,      // Added: DROP TABLE table_name;
     CMD_INSERT,          
-    CMD_SELECT           
+    CMD_SELECT,
+    CMD_DELETE           
 } CommandType;
 
 // --- Supporting Structures ---

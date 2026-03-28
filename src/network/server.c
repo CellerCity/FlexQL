@@ -90,6 +90,20 @@ void* client_handler(void* socket_desc) {
                 execute_create(current_db, &q);
             } else if (q.type == CMD_DROP_TABLE) {
                 execute_drop_table(current_db, &q);
+            } else if (q.type == CMD_DELETE) {
+                if (strlen(current_db) == 0) {
+                    strcpy(response, "ERROR|No database selected.\n");
+                } else {
+                    execute_delete(current_db, &q);
+                    
+                    // If the client deleted the table that is currently cached in RAM, 
+                    // we must force the server to close it so it doesn't write phantom data!
+                    if (active_pager != NULL && strcmp(active_table, q.table_name) == 0) {
+                        pager_close(active_pager);
+                        active_pager = NULL;
+                        active_table[0] = '\0';
+                    }
+                }
             } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
                 
                 if (strlen(current_db) == 0) {
