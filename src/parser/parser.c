@@ -49,10 +49,14 @@ ParsedQuery parse_sql(const char* sql_string) {
     query.join_table[0] = '\0';
     query.join_condition_left[0] = '\0';
     query.join_condition_right[0] = '\0';
+
+    query.bulk_insert_ptr = NULL;
     // ------------------------------
 
     // Make a working copy of the string (strtok modifies the original)
-    char sql_copy[1024];
+    // Dynamic allocation to prevent stack overflow!
+    char* sql_copy = strdup(sql_string);
+    char *token = strtok(sql_copy, " \t\n");
         
 
     strncpy(sql_copy, sql_string, sizeof(sql_copy) - 1);
@@ -211,46 +215,83 @@ ParsedQuery parse_sql(const char* sql_string) {
     // 4. INSERT COMMAND
     // Syntax: INSERT INTO table_name VALUES (...);
     // =========================================================
+    // =========================================================
+    // 4. INSERT COMMAND
+    // Syntax: INSERT INTO table_name VALUES (...), (...);
+    // =========================================================
     else if (strcasecmp(token, "INSERT") == 0) {
         query.type = CMD_INSERT;
-        token = strtok(NULL, " \t\n");
+        token = strtok(NULL, " \t\n"); // Should be "INTO"
+        
         if (token && strcasecmp(token, "INTO") == 0) {
-            token = strtok(NULL, " \t\n");
+            token = strtok(NULL, " \t\n("); // Should be table_name
+            
             if (token) {
                 strcpy(query.table_name, token);
                 
-                token = strtok(NULL, " \t\n(");
+                token = strtok(NULL, " \t\n("); // Should be "VALUES"
                 if (token && strcasecmp(token, "VALUES") == 0) {
-                    
+
+                    // --- BULK INSERT OPTIMIZATION ---
+                    // Find the very first '(' in the raw, unmodified SQL string
                     const char *start_paren = strchr(sql_string, '(');
-                    const char *end_paren = strrchr(sql_string, ')');
                     
-                    if (start_paren && end_paren && start_paren < end_paren) {
-                        char vals_str[512];
-                        int len = end_paren - start_paren - 1;
-                        strncpy(vals_str, start_paren + 1, len);
-                        vals_str[len] = '\0';
+                    // --- BULK INSERT OPTIMIZATION & VALIDATION ---
+                    const char *start_paren = strchr(sql_string, '(');
+                    
+                    if (start_paren) {
+                        // 1. FAST PRE-FLIGHT CHECK
+                        int open_count = 0;
+                        int close_count = 0;
+                        int in_string = 0;
+                        const char* scan_ptr = start_paren;
                         
-                        // Parse values separated by commas
-                        char *val_token = strtok(vals_str, ",");
-                        while (val_token && query.value_count < MAX_VALUES) {
-                            trim_string(val_token);
-                            strcpy(query.values[query.value_count], val_token);
-                            query.value_count++;
-                            val_token = strtok(NULL, ",");
+                        while (*scan_ptr != '\0' && *scan_ptr != ';') {
+                            // Ignore parens that are inside SQL strings (e.g., 'Hello (World)')
+                            if (*scan_ptr == '\'' || *scan_ptr == '"') {
+                                in_string = !in_string; 
+                            }
+                            
+                            if (!in_string) {
+                                if (*scan_ptr == '(') open_count++;
+                                if (*scan_ptr == ')') close_count++;
+                            }
+                            scan_ptr++;
                         }
-                        query.is_valid = 1;
+                        
+                        // 2. ENFORCE ATOMICITY
+                        // If parens don't match, or an open string was never closed, it's a corrupt batch!
+                        if (open_count == 0 || open_count != close_count || in_string) {
+                            strcpy(query.error_msg, "Syntax error: Malformed or incomplete tuple list in VALUES.");
+                            query.is_valid = 0;
+                        } else {
+                            // 3. IT IS SAFE. Hand it to the executor.
+                            query.bulk_insert_ptr = strdup(start_paren);
+                            query.is_valid = 1;
+                        }
+                        
                     } else {
                         strcpy(query.error_msg, "Syntax error: Missing parentheses in VALUES clause.");
+                        query.is_valid = 0;
                     }
+                    
+                    // NOTICE: WE DELETED ALL THE OLD strtok() LOGIC HERE!
+                    // The executor.c handles breaking this string into individual rows now.
+                    
                 } else {
                      strcpy(query.error_msg, "Syntax error: Expected VALUES keyword.");
+                     query.is_valid = 0;
                 }
+            } else {
+                 strcpy(query.error_msg, "Syntax error: Expected table name.");
+                 query.is_valid = 0;
             }
         } else {
              strcpy(query.error_msg, "Syntax error: Expected INTO after INSERT.");
+             query.is_valid = 0;
         }
     }
+
     // =========================================================
     // 5. SELECT COMMAND
     // Syntax: SELECT col1, col2 FROM tableA [INNER JOIN tableB ON A.c1 = B.c2] [WHERE col = val];
@@ -339,5 +380,6 @@ ParsedQuery parse_sql(const char* sql_string) {
         strcpy(query.error_msg, "Unsupported or unknown command.");
     }
 
+    free(sql_copy);
     return query;
 }

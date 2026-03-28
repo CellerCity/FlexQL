@@ -88,6 +88,21 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
     // Is it an INSERT query? Buffer it!
     if (strncasecmp(sql, "INSERT", 6) == 0) {
         int sql_len = strlen(sql);
+
+        // --- THE MASSIVE QUERY BYPASS ---
+        // If the query is larger than our buffer (like the TA's 250KB batch), fire it directly!
+        if (sql_len >= sizeof(db->write_buffer) - 2) {
+            if (db->buffer_pos > 0) {
+                send(db->sockfd, db->write_buffer, db->buffer_pos, 0);
+                db->buffer_pos = 0;
+            }
+            char* huge_query = malloc(sql_len + 2);
+            sprintf(huge_query, "%s\n", sql);
+            send(db->sockfd, huge_query, sql_len + 1, 0);
+            free(huge_query);
+            return FLEXQL_OK;
+        }
+
         
         // If the buffer is about to overflow, flush it to the server!
         if (db->buffer_pos + sql_len + 2 >= sizeof(db->write_buffer)) {

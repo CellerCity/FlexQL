@@ -30,8 +30,14 @@ void* client_handler(void* socket_desc) {
 
     // --- THE STREAM BUFFER ---
     // This holds leftover data if a TCP packet cuts a query in half
-    char stream_buffer[65536] = ""; 
-    char read_buffer[8192];
+
+    // Replaced the static char arrays with these dynamic heap pointers!
+    size_t MAX_BUFFER = 10 * 1024 * 1024; // 10 Megabytes
+    char* stream_buffer = malloc(MAX_BUFFER);
+    stream_buffer[0] = '\0';
+    char* read_buffer = malloc(65536);
+    char* client_message = malloc(MAX_BUFFER);
+
 
     while (recv(client_sock, read_buffer, sizeof(read_buffer) - 1, 0) > 0) {
         read_buffer[sizeof(read_buffer) - 1] = '\0'; // Safety null termination
@@ -46,7 +52,6 @@ void* client_handler(void* socket_desc) {
             
             *newline_ptr = '\0'; // Split the string at the newline
             
-            char client_message[2048];
             strcpy(client_message, stream_buffer); // Extract the single query
 
             // Shift the rest of the stream buffer to the left
@@ -131,7 +136,12 @@ void* client_handler(void* socket_desc) {
         memset(read_buffer, 0, sizeof(read_buffer));
     }
     graceful_shutdown:
-        if (active_pager != NULL) pager_close(active_pager); 
+        if (active_pager != NULL) 
+            pager_close(active_pager); 
+        
+        free(stream_buffer); 
+        free(read_buffer); 
+        free(client_message);
         printf("[Server] Client disconnected.\n");
         close(client_sock);
         return NULL;

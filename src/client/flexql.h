@@ -1,6 +1,10 @@
 #ifndef FLEXQL_H
 #define FLEXQL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Required Error Codes
 #define FLEXQL_OK 0
 #define FLEXQL_ERROR 1
@@ -27,5 +31,10 @@ int flexql_exec(
 
 // Frees memory allocated by the FlexQL API (like the errmsg).
 void flexql_free(void *ptr);
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

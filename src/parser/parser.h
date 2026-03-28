@@ -66,6 +66,8 @@ typedef struct {
     // Status tracking
     int is_valid; 
     char error_msg[MAX_ERROR_MSG_LEN];
+
+    char* bulk_insert_ptr; // Holds the massive string of tuples
 } ParsedQuery;
 
 // --- Function Prototypes ---
