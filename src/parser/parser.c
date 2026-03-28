@@ -51,6 +51,9 @@ ParsedQuery parse_sql(const char* sql_string) {
     query.join_condition_right[0] = '\0';
 
     query.bulk_insert_ptr = NULL;
+   
+    query.has_order_by = 0;
+    query.order_by_column[0] = '\0';
     // ------------------------------
 
     // Make a working copy of the string (strtok modifies the original)
@@ -300,7 +303,7 @@ ParsedQuery parse_sql(const char* sql_string) {
         query.type = CMD_SELECT;
         query.is_valid = 1; 
         
-        // State tracking: 1=Columns, 2=From, 3=Join, 4=Where
+        // State tracking: 1=Columns, 2=From, 3=Join, 4=Where, 5=Order By
         int state = 1; 
 
         while ((token = strtok(NULL, " \t\n;")) != NULL) {
@@ -340,7 +343,7 @@ ParsedQuery parse_sql(const char* sql_string) {
                 token = strtok(NULL, " \t\n;"); // Column
                 if (token) strcpy(query.where_column, token);
                 
-                token = strtok(NULL, " \t\n;"); // Operator (=, >, <)
+                token = strtok(NULL, " \t\n;"); // Operator (=, >, <, >=, <=)
                 if (token) strcpy(query.where_operator, token);
                 
                 token = strtok(NULL, " \t\n;"); // Value
@@ -350,6 +353,19 @@ ParsedQuery parse_sql(const char* sql_string) {
                 }
                 continue;
             }
+            
+            // --- THE NEW ORDER BY DETECTOR ---
+            if (strcasecmp(token, "ORDER") == 0) {
+                state = 5;
+                token = strtok(NULL, " \t\n;"); // Should be "BY"
+                if (token && strcasecmp(token, "BY") == 0) {
+                    query.has_order_by = 1;
+                    token = strtok(NULL, " \t\n;"); // Column Name
+                    if (token) strcpy(query.order_by_column, token);
+                }
+                continue;
+            }
+
 
             // --- Column Extraction (State 1) ---
             if (state == 1) {

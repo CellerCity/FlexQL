@@ -320,10 +320,74 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
 
 
 
+// --- HELPER STRUCTURES FOR TABLE SCANS & SORTING ---
+typedef struct {
+    char* row_str;
+    double sort_num;
+    char sort_str[64];
+} SortRow;
+
+int g_sort_type = 0; // 1 for Numbers, 2 for Strings
+
+int compare_sort_rows(const void* a, const void* b) {
+    SortRow* ra = (SortRow*)a;
+    SortRow* rb = (SortRow*)b;
+    if (g_sort_type == 1) {
+        if (ra->sort_num < rb->sort_num) return -1;
+        if (ra->sort_num > rb->sort_num) return 1;
+        return 0;
+    } else {
+        return strcmp(ra->sort_str, rb->sort_str);
+    }
+}
+
+// Evaluates >, <, =, >=, <= dynamically based on the column type!
+int evaluate_condition(int type, char* record_ptr, const char* op, const char* val_str) {
+    if (type == 1) { // INT
+        int32_t val; memcpy(&val, record_ptr, 4);
+        int32_t cmp = atoi(val_str);
+        if (strcmp(op, "=") == 0) return val == cmp;
+        if (strcmp(op, ">") == 0) return val > cmp;
+        if (strcmp(op, "<") == 0) return val < cmp;
+        if (strcmp(op, ">=") == 0) return val >= cmp;
+        if (strcmp(op, "<=") == 0) return val <= cmp;
+    } else if (type == 2) { // DECIMAL
+        double val; memcpy(&val, record_ptr, 8);
+        double cmp = atof(val_str);
+        if (strcmp(op, "=") == 0) return val == cmp;
+        if (strcmp(op, ">") == 0) return val > cmp;
+        if (strcmp(op, "<") == 0) return val < cmp;
+        if (strcmp(op, ">=") == 0) return val >= cmp;
+        if (strcmp(op, "<=") == 0) return val <= cmp;
+    } else if (type == 3) { // DATETIME
+        int64_t val; memcpy(&val, record_ptr, 8);
+        int64_t cmp = atoll(val_str); 
+        if (strcmp(op, "=") == 0) return val == cmp;
+        if (strcmp(op, ">") == 0) return val > cmp;
+        if (strcmp(op, "<") == 0) return val < cmp;
+        if (strcmp(op, ">=") == 0) return val >= cmp;
+        if (strcmp(op, "<=") == 0) return val <= cmp;
+    } else { // VARCHAR
+        uint16_t len; memcpy(&len, record_ptr, 2);
+        char str_val[256] = {0};
+        memcpy(str_val, record_ptr + 2, len);
+        int cmp = strcmp(str_val, val_str);
+        if (strcmp(op, "=") == 0) return cmp == 0;
+        if (strcmp(op, ">") == 0) return cmp > 0;
+        if (strcmp(op, "<") == 0) return cmp < 0;
+        if (strcmp(op, ">=") == 0) return cmp >= 0;
+        if (strcmp(op, "<=") == 0) return cmp <= 0;
+    }
+    return 0;
+}
+
+
+
 
 void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock) {
-    char net_buffer[2048]; // Buffer to build our network packets
-
+    char net_buffer[65536]; 
+    net_buffer[0] = '\0';
+    
     if (strlen(current_db) == 0) {
         sprintf(net_buffer, "ERROR|No database selected. Use 'USE <dbname>;' first.\n");
         send(client_sock, net_buffer, strlen(net_buffer), 0);
@@ -334,21 +398,17 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
     static char cached_table[256] = "";
     static ColumnDef cached_schema[100];
     static int cached_num_cols = 0;
+    static int cached_types[100]; // 1=INT, 2=DECIMAL, 3=DATETIME, 4=VARCHAR
 
-    // Array to hold pre-computed integer types! (1=INT, 2=DECIMAL, 3=STRING)
-    static int cached_types[100];
-
-    // Only hit the hard drive if the user queries a DIFFERENT table!
     if (strcmp(cached_table, query->table_name) != 0) {
         cached_num_cols = load_schema(current_db, query->table_name, cached_schema);
         if (cached_num_cols != -1) {
             strcpy(cached_table, query->table_name);
-            
-            // THE OPTIMIZATION: Translate the slow strings into fast integers ONCE!
             for (int i = 0; i < cached_num_cols; i++) {
                 if (strcasecmp(cached_schema[i].type, "INT") == 0) cached_types[i] = 1;
                 else if (strcasecmp(cached_schema[i].type, "DECIMAL") == 0) cached_types[i] = 2;
-                else cached_types[i] = 3; 
+                else if (strcasecmp(cached_schema[i].type, "DATETIME") == 0) cached_types[i] = 3;
+                else cached_types[i] = 4; 
             }
         }
     }
@@ -359,96 +419,218 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         return;
     }
 
-    // 1. Setup Search Key (NO MORE STRING COMPARISON!)
-    IndexKey search_key;
-    if (cached_types[0] == 1) { 
-        search_key.type = 1;
-        search_key.value.int_val = atoi(query->where_value); 
-    } else {
-        search_key.type = 4;
-        strncpy(search_key.value.str_val, query->where_value, 32);
+    // Determine how many columns to actually send (Projection logic)
+    int cols_to_send = query->select_column_count == 0 ? cached_num_cols : query->select_column_count;
+
+    // ==========================================
+    // THE TRAFFIC COP: Route to B-Tree or Scan
+    // ==========================================
+    int use_btree = 0;
+    if (query->has_where && strcmp(query->where_column, cached_schema[0].name) == 0 && strcmp(query->where_operator, "=") == 0) {
+        use_btree = 1; 
     }
 
-    RecordID result;
-    
-    // 2. Search Tree
-    if (btree_search(pager, root_page_id, search_key, &result)) {
-        Page* data_page = get_page(pager, result.page_num);
-        Slot* slots = (Slot*)data_page->data;
-        Slot my_slot = slots[result.slot_num];
-        
-        char* raw_record = &data_page->data[my_slot.offset - sizeof(PageHeader)];
-        
-        // 3. Check Expiration
-        TupleHeader header;
-        memcpy(&header, raw_record, sizeof(TupleHeader));
-        
-        if (header.expiration_timestamp < (uint64_t)time(NULL)) {
-            sprintf(net_buffer, "ERROR|Record found, but it has EXPIRED.\n");
-            send(client_sock, net_buffer, strlen(net_buffer), 0);
+    if (use_btree) {
+        // ----------------------------------------------------
+        // PATH A: EXACT MATCH (Use the O(log N) B-Tree)
+        // ----------------------------------------------------
+        IndexKey search_key;
+        if (cached_types[0] == 1) { search_key.type = 1; search_key.value.int_val = atoi(query->where_value); } 
+        else { search_key.type = 4; strncpy(search_key.value.str_val, query->where_value, 32); }
+
+        RecordID result;
+        if (btree_search(pager, root_page_id, search_key, &result)) {
+            Page* data_page = get_page(pager, result.page_num);
+            Slot* slots = (Slot*)data_page->data;
+            char* raw_record = &data_page->data[slots[result.slot_num].offset - sizeof(PageHeader)];
+            
+            TupleHeader header; memcpy(&header, raw_record, sizeof(TupleHeader));
+            if (header.expiration_timestamp >= (uint64_t)time(NULL)) {
+                
+                char* ptr = net_buffer;
+                ptr += sprintf(ptr, "ROW|%d", cols_to_send);
+                uint16_t offset = sizeof(TupleHeader); 
+
+                for (int i = 0; i < cached_num_cols; i++) {
+                    int selected = (query->select_column_count == 0);
+                    if (!selected) {
+                        for(int j=0; j<query->select_column_count; j++){
+                            if(strcasecmp(query->select_columns[j], cached_schema[i].name) == 0) { selected = 1; break; }
+                        }
+                    }
+
+                    if (selected) {
+                        *ptr++ = '|';
+                        int name_len = strlen(cached_schema[i].name);
+                        memcpy(ptr, cached_schema[i].name, name_len);
+                        ptr += name_len;
+                        *ptr++ = '|';
+
+                        if (cached_types[i] == 1) {
+                            int32_t val; memcpy(&val, raw_record + offset, 4);
+                            ptr += sprintf(ptr, "%d", val); offset += 4;
+                        } else if (cached_types[i] == 2) {
+                            double val; memcpy(&val, raw_record + offset, 8);
+                            ptr += sprintf(ptr, "%g", val); offset += 8; // %g drops trailing zeros!
+                        } else if (cached_types[i] == 3) {
+                            int64_t val; memcpy(&val, raw_record + offset, 8);
+                            ptr += sprintf(ptr, "%lld", (long long)val); offset += 8;
+                        } else {
+                            uint16_t len; memcpy(&len, raw_record + offset, 2); offset += 2;
+                            memcpy(ptr, raw_record + offset, len); ptr += len; offset += len;
+                        }
+                    } else {
+                        // Skip the memory block if not selected!
+                        if (cached_types[i] == 1) offset += 4;
+                        else if (cached_types[i] == 2) offset += 8;
+                        else if (cached_types[i] == 3) offset += 8;
+                        else { uint16_t len; memcpy(&len, raw_record + offset, 2); offset += 2 + len; }
+                    }
+                }
+                
+                *ptr++ = '\n';
+                const char* done_msg = "DONE|Query executed successfully.\n";
+                memcpy(ptr, done_msg, strlen(done_msg));
+                ptr += strlen(done_msg);
+                send(client_sock, net_buffer, ptr - net_buffer, 0);
+            }
+            unpin_page(pager, result.page_num, 0); 
         } else {
-            // --- THE HIGH-PERFORMANCE MEMORY BLASTER ---
-            char* ptr = net_buffer; // Start the pointer at the beginning of the buffer
-            
-            // 1. Write the header and advance the pointer by the exact number of bytes written
-            ptr += sprintf(ptr, "ROW|%d", cached_num_cols);
-            
-            uint16_t offset = sizeof(TupleHeader); 
+            send(client_sock, "DONE|0 rows returned.\n", 22, 0);
+        }
 
+    } else {
+        // ----------------------------------------------------
+        // PATH B: RANGE / SORT / NON-PK (Full Table Scan)
+        // ----------------------------------------------------
+        int where_idx = -1;
+        if (query->has_where) {
             for (int i = 0; i < cached_num_cols; i++) {
-                // 2. Direct memory writes for the column name (Bypasses sprintf parsing)
-                *ptr++ = '|'; // Drop a pipe and move the pointer 1 byte
-                int name_len = strlen(cached_schema[i].name);
-                memcpy(ptr, cached_schema[i].name, name_len);
-                ptr += name_len;
-                *ptr++ = '|';
+                if (strcasecmp(cached_schema[i].name, query->where_column) == 0) { where_idx = i; break; }
+            }
+        }
 
-                // 3. Process the data
-                // CRITICAL SPEEDUP: Single-cycle integer checks instead of strcasecmp!
-                if (cached_types[i] == 1) {
-                    int32_t val;
-                    memcpy(&val, raw_record + offset, sizeof(int32_t));
+        int order_idx = -1;
+        if (query->has_order_by) {
+            for (int i = 0; i < cached_num_cols; i++) {
+                if (strcasecmp(cached_schema[i].name, query->order_by_column) == 0) { order_idx = i; break; }
+            }
+        }
+
+        // Allocate a dynamic array to hold our unsorted results
+        SortRow* results = malloc(sizeof(SortRow) * 10000); 
+        int match_count = 0;
+
+        for (uint32_t pid = 1; pid < pager->num_pages; pid++) {
+            Page* page = get_page(pager, pid);
+            
+            if (page->header.page_type == 0) { // Data Page
+                Slot* slots = (Slot*)page->data;
+                for (int s = 0; s < page->header.num_slots; s++) {
+                    char* raw_record = &page->data[slots[s].offset - sizeof(PageHeader)];
                     
-                    // We still use sprintf for the number, but we write it directly to the pointer
-                    ptr += sprintf(ptr, "%d", val); 
-                    
-                    offset += sizeof(int32_t);
-                } else if (cached_types[i] == 2) {
-                    double val;
-                    memcpy(&val, raw_record + offset, sizeof(double));
-                    ptr += sprintf(ptr, "%.2f", val);
-                    offset += sizeof(double);
-                } else {
-                    // varchar
-                    uint16_t len;
-                    memcpy(&len, raw_record + offset, sizeof(uint16_t));
-                    offset += sizeof(uint16_t);
-                    
-                    // CRITICAL SPEEDUP: Direct memory copy for strings! No format parsing!
-                    memcpy(ptr, raw_record + offset, len);
-                    ptr += len;
-                    
-                    offset += len;
+                    TupleHeader header; memcpy(&header, raw_record, sizeof(TupleHeader));
+                    if (header.expiration_timestamp < (uint64_t)time(NULL)) continue;
+
+                    // Calculate memory offsets for this specific row dynamically
+                    uint16_t offsets[100];
+                    uint16_t cur_off = sizeof(TupleHeader);
+                    for(int i = 0; i < cached_num_cols; i++) {
+                        offsets[i] = cur_off;
+                        if(cached_types[i] == 1) cur_off += 4;
+                        else if(cached_types[i] == 2) cur_off += 8;
+                        else if(cached_types[i] == 3) cur_off += 8;
+                        else { uint16_t len; memcpy(&len, raw_record + cur_off, 2); cur_off += 2 + len; }
+                    }
+
+                    // Check condition
+                    int match = 1;
+                    if (where_idx != -1) {
+                        match = evaluate_condition(cached_types[where_idx], raw_record + offsets[where_idx], query->where_operator, query->where_value);
+                    }
+
+                    if (match && match_count < 10000) {
+                        char temp_row[2048]; char* ptr = temp_row;
+                        ptr += sprintf(ptr, "ROW|%d", cols_to_send);
+
+                        for (int i = 0; i < cached_num_cols; i++) {
+                            int selected = (query->select_column_count == 0);
+                            if (!selected) {
+                                for(int j=0; j<query->select_column_count; j++){
+                                    if(strcasecmp(query->select_columns[j], cached_schema[i].name) == 0) { selected = 1; break; }
+                                }
+                            }
+                            if (selected) {
+                                *ptr++ = '|';
+                                int n_len = strlen(cached_schema[i].name);
+                                memcpy(ptr, cached_schema[i].name, n_len); ptr += n_len;
+                                *ptr++ = '|';
+
+                                if (cached_types[i] == 1) {
+                                    int32_t v; memcpy(&v, raw_record + offsets[i], 4);
+                                    ptr += sprintf(ptr, "%d", v);
+                                } else if (cached_types[i] == 2) {
+                                    double v; memcpy(&v, raw_record + offsets[i], 8);
+                                    ptr += sprintf(ptr, "%g", v); 
+                                } else if (cached_types[i] == 3) {
+                                    int64_t v; memcpy(&v, raw_record + offsets[i], 8);
+                                    ptr += sprintf(ptr, "%lld", (long long)v);
+                                } else {
+                                    uint16_t len; memcpy(&len, raw_record + offsets[i], 2);
+                                    memcpy(ptr, raw_record + offsets[i] + 2, len); ptr += len;
+                                }
+                            }
+                        }
+                        *ptr = '\0'; // Null terminate the string safely
+                        results[match_count].row_str = strdup(temp_row);
+
+                        // Extract the Sorting Key
+                        if (order_idx != -1) {
+                            if (cached_types[order_idx] == 1) {
+                                int32_t v; memcpy(&v, raw_record + offsets[order_idx], 4);
+                                results[match_count].sort_num = (double)v; g_sort_type = 1;
+                            } else if (cached_types[order_idx] == 2) {
+                                double v; memcpy(&v, raw_record + offsets[order_idx], 8);
+                                results[match_count].sort_num = v; g_sort_type = 1;
+                            } else if (cached_types[order_idx] == 3) {
+                                int64_t v; memcpy(&v, raw_record + offsets[order_idx], 8);
+                                results[match_count].sort_num = (double)v; g_sort_type = 1;
+                            } else {
+                                uint16_t len; memcpy(&len, raw_record + offsets[order_idx], 2);
+                                int cp_len = len < 63 ? len : 63;
+                                memcpy(results[match_count].sort_str, raw_record + offsets[order_idx] + 2, cp_len);
+                                results[match_count].sort_str[cp_len] = '\0'; g_sort_type = 2;
+                            }
+                        }
+                        match_count++;
+                    }
                 }
             }
-            
-            // 4. Append the DONE message directly to the pointer
-            const char* done_msg = "\nDONE|Query executed successfully.\n";
-            int done_len = 35; // We hardcode the length because we know exactly how long it is
-            memcpy(ptr, done_msg, done_len);
-            ptr += done_len;
-            
-            // 5. Send exactly the bytes we wrote! 
-            // Notice we use (ptr - net_buffer) to calculate the size. NO STRLEN ALLOWED!
-            send(client_sock, net_buffer, ptr - net_buffer, 0);
+            unpin_page(pager, pid, 0);
+        }
+
+        // Sort Data
+        if (query->has_order_by && match_count > 0) {
+            qsort(results, match_count, sizeof(SortRow), compare_sort_rows);
+        }
+
+        // Batch send the rows back to the client!
+        char* net_ptr = net_buffer;
+        for (int i = 0; i < match_count; i++) {
+            int rlen = strlen(results[i].row_str);
+            if ((net_ptr - net_buffer) + rlen + 2 >= sizeof(net_buffer)) {
+                send(client_sock, net_buffer, net_ptr - net_buffer, 0);
+                net_ptr = net_buffer;
+            }
+            memcpy(net_ptr, results[i].row_str, rlen); net_ptr += rlen;
+            *net_ptr++ = '\n'; 
+            free(results[i].row_str);
         }
         
-        unpin_page(pager, result.page_num, 0); 
-    } else {
-        // If the record isn't found, we just send a DONE message with 0 rows
-        char* done_msg = "DONE|0 rows returned.\n";
-        send(client_sock, done_msg, strlen(done_msg), 0);
+        const char* done_msg = "DONE|Query executed successfully.\n";
+        memcpy(net_ptr, done_msg, strlen(done_msg)); net_ptr += strlen(done_msg);
+        send(client_sock, net_buffer, net_ptr - net_buffer, 0);
+
+        free(results);
     }
 }
-
-

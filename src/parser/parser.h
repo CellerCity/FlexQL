@@ -68,6 +68,9 @@ typedef struct {
     char error_msg[MAX_ERROR_MSG_LEN];
 
     char* bulk_insert_ptr; // Holds the massive string of tuples
+
+    char order_by_column[64];
+    int has_order_by;
 } ParsedQuery;
 
 // --- Function Prototypes ---
