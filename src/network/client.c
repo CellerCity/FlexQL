@@ -5,17 +5,17 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 #define SERVER_IP "127.0.0.1"
 #define PORT 9000
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE (1024 * 1024) // 1MB buffer to hold large query results
 
 int main(int argc, char *argv[]) {
     int sock;
     struct sockaddr_in server_addr;
-    char buffer[BUFFER_SIZE];
-    char server_response[BUFFER_SIZE];
-
+    char* buffer = malloc(BUFFER_SIZE);
+    
     const char *ip = (argc > 1) ? argv[1] : SERVER_IP;
     int port = (argc > 2) ? atoi(argv[2]) : PORT;
 
@@ -39,55 +39,130 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("[+] Connected to FlexQL server at %s:%d\n\n", ip, port);
-
-    // --- FIX 1: Catch the initial welcome message! ---
-    int bytes_read = read(sock, server_response, sizeof(server_response) - 1);
+    // --- 1. Catch the initial CONNECTED message! ---
+    int bytes_read = read(sock, buffer, BUFFER_SIZE - 1);
     if (bytes_read > 0) {
-        server_response[bytes_read] = '\0';
-        printf("%s", server_response); // Print the server's welcome and "> " prompt
-        fflush(stdout); // Ensure it prints immediately
+        buffer[bytes_read] = '\0';
+        if (strncmp(buffer, "CONNECTED", 9) == 0) {
+            printf("\n========================================\n");
+            printf("  Welcome to the FlexQL Database CLI    \n");
+            printf("  Connected to %s:%d\n", ip, port);
+            printf("  Type '.exit' to quit.\n");
+            printf("========================================\n\n");
+        }
     }
 
-    // 4. Main REPL Loop
+    // --- 2. Main REPL Loop ---
+    char input[2048];
     while (1) {
-        // FIX 2: Removed "flexql> " because the server provides the "> " prompt!
+        // We now provide our own prompt!
+        printf("flexql> ");
+        fflush(stdout);
         
-        if (fgets(buffer, sizeof(buffer), stdin) == NULL) break;
+        if (fgets(input, sizeof(input), stdin) == NULL) break;
 
-        buffer[strcspn(buffer, "\n")] = 0;
+        input[strcspn(input, "\n")] = 0; // Strip newline
 
-        if (strcmp(buffer, ".exit") == 0) {
-            printf("Connection closed\n");
+        if (strcmp(input, ".exit") == 0) {
+            printf("Closing connection. Goodbye!\n");
             break;
         }
 
-        if (strlen(buffer) == 0) {
-            // If user hits enter, send a blank space to trigger the server's empty-check
-            send(sock, " ", 1, 0); 
-        } else {
-            if (send(sock, buffer, strlen(buffer), 0) < 0) break;
-        }
+        if (strlen(input) == 0) continue; // Ignore empty enters
 
-        // Wait for the server's response
-        bytes_read = read(sock, server_response, sizeof(server_response) - 1);
-        if (bytes_read > 0) {
-            server_response[bytes_read] = '\0';
-            printf("%s", server_response); // Prints the response and the next "> "
-            fflush(stdout);
-        } else if (bytes_read == 0) {
-            printf("\n[-] Server closed the connection.\n");
-            break;
-        } else {
-            perror("[-] Read failed");
-            break;
+        // Append newline so the server's streaming parser knows a query ended
+        char network_query[2048];
+        snprintf(network_query, sizeof(network_query), "%s\n", input);
+
+        if (send(sock, network_query, strlen(network_query), 0) < 0) break;
+
+        // --- 3. Receive and Parse the Server's Response ---
+        
+        // =========================================================
+        // THE FIRE-AND-FORGET BYPASS
+        // We do not wait for a response on INSERTs to maintain pipeline speeds!
+        // =========================================================
+        if (strncasecmp(input, "INSERT", 6) == 0) {
+            struct pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLIN;
+            
+            // Wait up to 50 milliseconds for the server to yell an error
+            if (poll(&pfd, 1, 50) > 0) {
+                // The server sent something! (Likely a syntax error)
+                bytes_read = read(sock, buffer, BUFFER_SIZE - 1);
+                if (bytes_read > 0) {
+                    buffer[bytes_read] = '\0';
+                    char* msg = buffer;
+                    if (strncmp(buffer, "ERROR|", 6) == 0) msg += 6;
+                    printf("[-] %s\n\n", msg);
+                }
+            } else {
+                // Silence means success in our pipelined architecture!
+                printf("[+] Query executed successfully.\n\n");
+            }
+            continue; // Skip the blocking read loop below!
+        }
+        // =========================================================
+
+
+        int server_done = 0;
+        int rows_returned = 0;
+
+        while (!server_done) {
+            memset(buffer, 0, BUFFER_SIZE);
+            bytes_read = read(sock, buffer, BUFFER_SIZE - 1);
+            
+            if (bytes_read <= 0) {
+                printf("\n[-] Server disconnected abruptly.\n");
+                server_done = 1;
+                break;
+            }
+            buffer[bytes_read] = '\0';
+
+            // Parse the response line by line
+            char *saveptr_line;
+            char *line = strtok_r(buffer, "\n", &saveptr_line);
+            
+            while (line != NULL) {
+                if (strncmp(line, "DONE|", 5) == 0) {
+                    if (rows_returned > 0) {
+                        printf("(%d rows returned)\n", rows_returned);
+                    }
+                    printf("[+] %s\n\n", line + 5);
+                    server_done = 1;
+                } 
+                else if (strncmp(line, "ERROR|", 6) == 0) {
+                    printf("[-] %s\n\n", line + 6);
+                    server_done = 1;
+                } 
+                else if (strncmp(line, "ROW|", 4) == 0) {
+                    // Beautifully format the ROW data for the terminal
+                    char *saveptr_col;
+                    strtok_r(line, "|", &saveptr_col); // Skip "ROW"
+                    
+                    char *col_count_str = strtok_r(NULL, "|", &saveptr_col);
+                    if (col_count_str) {
+                        int cols = atoi(col_count_str);
+                        printf("  > ");
+                        for (int i = 0; i < cols; i++) {
+                            char *name = strtok_r(NULL, "|", &saveptr_col);
+                            char *val = strtok_r(NULL, "|", &saveptr_col);
+                            if (name && val) {
+                                printf("%s: %s", name, val);
+                                if (i < cols - 1) printf("  |  ");
+                            }
+                        }
+                        printf("\n");
+                        rows_returned++;
+                    }
+                }
+                line = strtok_r(NULL, "\n", &saveptr_line);
+            }
         }
     }
 
+    free(buffer);
     close(sock);
     return 0;
-}
-
-
-
-// gcc src/network/client.c -o flexql-client
+} 
