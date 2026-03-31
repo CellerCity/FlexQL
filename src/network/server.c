@@ -20,9 +20,10 @@ void* client_handler(void* socket_desc) {
     free(socket_desc); 
 
     // --- THE DEFAULT DB FIX ---
-    // Auto-assign the client to a default database and ensure the folder exists!
+    // Auto-assign the client to a default database and ensure the sandbox exists!
     char current_db[MAX_DB_NAME_LEN] = "default_db"; 
-    mkdir(current_db, 0777); 
+    mkdir("flexql_data", 0777); 
+    mkdir("flexql_data/default_db", 0777);
 
     uint32_t active_root_page = 0; 
     uint32_t active_data_page = 1; 
@@ -78,31 +79,44 @@ void* client_handler(void* socket_desc) {
             } else if (q.type == CMD_USE_DB) {
                 if (execute_use_db(&q, current_db) != 0) strcpy(response, "ERROR|Database does not exist.\n");
             } else if (q.type == CMD_DROP_DB) {
-                execute_drop_db(&q, current_db);
+                if (execute_drop_db(&q, current_db) != 0) strcpy(response, "ERROR|Database does not exist.\n");
             } else if (q.type == CMD_CREATE_TABLE) {
-                execute_create(current_db, &q);
+                if (execute_create(current_db, &q) != 0) strcpy(response, "ERROR|Failed to create table.\n");
             } else if (q.type == CMD_DROP_TABLE) {
-                execute_drop_table(current_db, &q);
+                if (execute_drop_table(current_db, &q) != 0) strcpy(response, "ERROR|Table does not exist.\n");
             } else if (q.type == CMD_DELETE) {
-                execute_delete(current_db, &q);
-                if (active_pager != NULL && strcmp(active_table, q.table_name) == 0) {
-                    pager_close(active_pager);
-                    active_pager = NULL;
-                    active_table[0] = '\0';
+                if (execute_delete(current_db, &q) != 0) {
+                    strcpy(response, "ERROR|Table does not exist.\n");
+                } else {
+                    if (active_pager != NULL && strcmp(active_table, q.table_name) == 0) {
+                        pager_close(active_pager);
+                        active_pager = NULL;
+                        active_table[0] = '\0';
+                    }
                 }
+            } else if (q.type == CMD_SHOW_DB) {
+                execute_show_db(client_sock);
+                send_default_response = 0;
+            } else if (q.type == CMD_SHOW_TABLES) {
+                execute_show_tables(current_db, client_sock);
+                send_default_response = 0;
             } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
                 
                 if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
                     if (active_pager != NULL) pager_close(active_pager); 
                     char filepath[512];
-                    snprintf(filepath, sizeof(filepath), "%s/%s.dat", current_db, q.table_name);
+                    snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
                     active_pager = pager_open(filepath);
                     strcpy(active_table, q.table_name);
                 }
                 
                 if (q.type == CMD_INSERT) {
-                    execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q);
-                    send_default_response = 0;
+                    int status = execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, client_sock);
+                    
+                    if (status == -1) {
+                        // The executor already sent the ERROR| string, so we prevent the server from sending DONE|
+                        send_default_response = 0; 
+                    }
                 } else if (q.type == CMD_SELECT) {
                     send_default_response = 0; 
                     execute_select(current_db, active_pager, active_root_page, &q, client_sock);

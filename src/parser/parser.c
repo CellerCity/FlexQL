@@ -52,9 +52,14 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
         
         token = strtok_r(NULL, " \t\n(", &saveptr);
         if (token && strcasecmp(token, "IF") == 0) {
-            strtok_r(NULL, " \t\n", &saveptr); // skip NOT
-            strtok_r(NULL, " \t\n", &saveptr); // skip EXISTS
-            token = strtok_r(NULL, " \t\n(", &saveptr);
+            char* next1 = strtok_r(NULL, " \t\n", &saveptr);
+            char* next2 = strtok_r(NULL, " \t\n", &saveptr);
+            if (next1 && strcasecmp(next1, "NOT") == 0 && next2 && strcasecmp(next2, "EXISTS") == 0) {
+                token = strtok_r(NULL, " \t\n(", &saveptr); // Grab the actual table name
+            } else {
+                strcpy(query->error_msg, "Syntax error: Did you mean IF NOT EXISTS?");
+                return;
+            }
         }
 
         if (token) {
@@ -231,6 +236,15 @@ static void parse_delete(char* saveptr, ParsedQuery* query) {
         if (token) {
             strcpy(query->table_name, token);
             query->is_valid = 1;
+            
+            // --- THE SAFETY LOCK ---
+            // If the user tries to use WHERE, we stop them immediately to prevent data loss!
+            token = strtok_r(NULL, " \t\n;", &saveptr);
+            if (token && strcasecmp(token, "WHERE") == 0) {
+                strcpy(query->error_msg, "Syntax error: DELETE with WHERE is not supported. Use DELETE FROM table to truncate the entire table.");
+                query->is_valid = 0;
+            }
+            
         } else {
             strcpy(query->error_msg, "Syntax error: Expected table name after FROM.");
         }
@@ -399,3 +413,6 @@ ParsedQuery parse_sql(const char* sql_string) {
     free(sql_copy);
     return query;
 }
+
+
+// g++ rigorous_tests.cpp src/client/flexql.c -o rigorous_tests -std=c++11
