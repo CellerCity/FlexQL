@@ -342,3 +342,8 @@ int main(int argc, char **argv) {
     flexql_close(db);
     return 0;
 }
+
+
+// g++ benchmark_flexql.cpp src/client/flexql.c -o benchmark_flexql -std=c++11
+// ./benchmark_flexql 1000000
+// ./benchmark_flexql --unit-test

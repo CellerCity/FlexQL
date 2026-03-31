@@ -467,9 +467,19 @@ int evaluate_condition(int type, char* record_ptr, const char* op, const char* v
         if (strcmp(op, "<") == 0) return val < cmp;
         if (strcmp(op, ">=") == 0) return val >= cmp;
         if (strcmp(op, "<=") == 0) return val <= cmp;
-    } else if (type == 3) { // DATETIME
+    } else if (type == 3) { /// DATETIME
         int64_t val; memcpy(&val, record_ptr, 8);
-        int64_t cmp = atoll(val_str); 
+        int64_t cmp = 0;
+        
+        // Convert the WHERE string into a true Epoch integer!
+        struct tm tm_info; memset(&tm_info, 0, sizeof(struct tm));
+        if (strptime(val_str, "%Y-%m-%d %H:%M:%S", &tm_info) != NULL ||
+            strptime(val_str, "%Y-%m-%d", &tm_info) != NULL) {
+            cmp = (int64_t)mktime(&tm_info);
+        } else {
+            cmp = atoll(val_str); // Fallback
+        }
+
         if (strcmp(op, "=") == 0) return val == cmp;
         if (strcmp(op, ">") == 0) return val > cmp;
         if (strcmp(op, "<") == 0) return val < cmp;
@@ -547,7 +557,16 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         IndexKey search_key;
         if (cached_types[0] == 1) { search_key.type = 1; search_key.value.int_val = atoi(query->where_value); } 
         else if (cached_types[0] == 2) { search_key.type = 2; search_key.value.dec_val = atof(query->where_value); }
-        else if (cached_types[0] == 3) { search_key.type = 3; search_key.value.dt_val = atoll(query->where_value); }
+        else if (cached_types[0] == 3) { 
+            search_key.type = 3; 
+            struct tm tm_info; memset(&tm_info, 0, sizeof(struct tm));
+            if (strptime(query->where_value, "%Y-%m-%d %H:%M:%S", &tm_info) != NULL ||
+                strptime(query->where_value, "%Y-%m-%d", &tm_info) != NULL) {
+                search_key.value.dt_val = (int64_t)mktime(&tm_info);
+            } else {
+                search_key.value.dt_val = atoll(query->where_value);
+            }
+        }
         else { search_key.type = 4; strncpy(search_key.value.str_val, query->where_value, 32); }
 
         RecordID result;

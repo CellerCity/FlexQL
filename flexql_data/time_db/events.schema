@@ -1,0 +1,3 @@
+id INT
+name VARCHAR
+event_date DATETIME
