@@ -12,6 +12,41 @@
 #include <sys/stat.h>  // For mkdir() and stat()
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <pthread.h>
+
+// =========================================================
+// TABLE-LEVEL CONCURRENCY CONTROL (Lock Manager)
+// =========================================================
+typedef struct {
+    char table_name[256];
+    pthread_rwlock_t rwlock;
+} TableLock;
+
+static TableLock table_locks[100];
+static int num_table_locks = 0;
+static pthread_mutex_t lock_manager_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Dynamically gets or creates a Read-Write lock for a specific table
+pthread_rwlock_t* get_table_lock(const char* table_name) {
+    pthread_mutex_lock(&lock_manager_mutex);
+    
+    // Check if lock already exists
+    for(int i = 0; i < num_table_locks; i++) {
+        if(strcasecmp(table_locks[i].table_name, table_name) == 0) {
+            pthread_mutex_unlock(&lock_manager_mutex);
+            return &table_locks[i].rwlock;
+        }
+    }
+    
+    // Create new lock for this table
+    strcpy(table_locks[num_table_locks].table_name, table_name);
+    pthread_rwlock_init(&table_locks[num_table_locks].rwlock, NULL);
+    pthread_rwlock_t* new_lock = &table_locks[num_table_locks].rwlock;
+    num_table_locks++;
+    
+    pthread_mutex_unlock(&lock_manager_mutex);
+    return new_lock;
+}
 
 extern void trim_string(char *str);
 
@@ -341,6 +376,10 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
 
     char* ptr = query->bulk_insert_ptr;
     char tuple_buffer[MAX_TUPLE_SIZE];
+    
+    // Grab EXCLUSIVE Write Lock!
+    pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
+    pthread_rwlock_wrlock(t_lock);
 
     while (*ptr != '\0') {
         if (*ptr == '(') {
@@ -367,7 +406,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
             if (query->value_count != cached_num_cols) {
                 char err[128]; snprintf(err, 128, "ERROR|Column count mismatch. Expected %d, got %d.\n", cached_num_cols, query->value_count);
                 send(client_sock, err, strlen(err), 0);
-                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
+                return -1;
             }
 
             // SEMANTIC CONSTRAINT: NOT NULL Check
@@ -376,7 +417,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
                     if (strlen(query->values[i]) == 0 || strcasecmp(query->values[i], "NULL") == 0) {
                         char err[128]; snprintf(err, 128, "ERROR|NOT NULL constraint violation on column '%s'.\n", cached_schema[i].name);
                         send(client_sock, err, strlen(err), 0);
-                        free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+                        free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                        pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
+                        return -1;
                     }
                 }
             }
@@ -412,7 +455,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
                 if (btree_search(pager, *root_page_id, pk, &dummy)) {
                     const char* err = "ERROR|Duplicate Primary Key constraint violation.\n";
                     send(client_sock, err, strlen(err), 0);
-                    free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+                    free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                    pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
+                    return -1;
                 }
             }
 
@@ -422,7 +467,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
 type_err:
                 const char* err = "ERROR|Invalid datatype or missing required field.\n";
                 send(client_sock, err, strlen(err), 0);
-                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
+                return -1;
             }
 
             // ALWAYS save to the hard drive (Data Page)
@@ -437,6 +484,7 @@ type_err:
     }
 
     free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+    pthread_rwlock_unlock(t_lock); // Release lock!
     return 0;
 }
 
@@ -524,20 +572,34 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         send(client_sock, "ERROR|No database selected.\n", 28, 0); return;
     }
 
+    // Grab SHARED Read Lock!
+    pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
+    pthread_rwlock_rdlock(t_lock);
 
     
     // =========================================================
     // THE ULTIMATE INNER JOIN ENGINE (With WHERE & Fallbacks)
     // =========================================================
     if (query->has_join) {
+
+        // Grab a lock for Table B too!
+        pthread_rwlock_t* t_lock_B = get_table_lock(query->join_table);
+        pthread_rwlock_rdlock(t_lock_B);
+
         char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
 
         // 1. Load Schemas
         ColumnDef schema_A[100]; int cols_A = load_schema(db_path, query->table_name, schema_A);
-        if (cols_A == -1) { send(client_sock, "ERROR|Left table missing.\n", 26, 0); return; }
+        if (cols_A == -1) { 
+            send(client_sock, "ERROR|Left table missing.\n", 26, 0); 
+            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+        }
 
         ColumnDef schema_B[100]; int cols_B = load_schema(db_path, query->join_table, schema_B);
-        if (cols_B == -1) { send(client_sock, "ERROR|Right table missing.\n", 27, 0); return; }
+        if (cols_B == -1) { 
+            send(client_sock, "ERROR|Right table missing.\n", 27, 0); 
+            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+        }
 
         // 2. Identify Join Columns
         int join_idx_A = -1, join_idx_B = -1;
@@ -547,8 +609,11 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         for (int i = 0; i < cols_A; i++) if (strcasecmp(schema_A[i].name, base_left) == 0 || strcasecmp(schema_A[i].name, base_right) == 0) join_idx_A = i;
         for (int i = 0; i < cols_B; i++) if (strcasecmp(schema_B[i].name, base_left) == 0 || strcasecmp(schema_B[i].name, base_right) == 0) join_idx_B = i;
 
-        if (join_idx_A == -1 || join_idx_B == -1) { send(client_sock, "ERROR|Join columns not found.\n", 30, 0); return; }
-
+        if (join_idx_A == -1 || join_idx_B == -1) { 
+            send(client_sock, "ERROR|Join columns not found.\n", 30, 0); 
+            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+        }
+        
         int type_join = 4;
         if (strcasecmp(schema_A[join_idx_A].type, "INT") == 0) type_join = 1;
         else if (strcasecmp(schema_A[join_idx_A].type, "DECIMAL") == 0) type_join = 2;
@@ -593,7 +658,10 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         // Open Table B's Pager
         char path_B[512]; snprintf(path_B, sizeof(path_B), "%s/%s.dat", db_path, query->join_table);
         Pager* pager_B = pager_open(path_B);
-        if (!pager_B) { send(client_sock, "ERROR|Failed to open right table.\n", 34, 0); return; }
+        if (!pager_B) { 
+            send(client_sock, "ERROR|Failed to open right table.\n", 34, 0); 
+            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+        }
 
         char* net_ptr = net_buffer; int rows_sent = 0;
 
@@ -872,6 +940,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         send(client_sock, done_msg, strlen(done_msg), 0);
         
         pager_close(pager_B);
+
+        pthread_rwlock_unlock(t_lock_B); // Release Table B!
+        pthread_rwlock_unlock(t_lock);   // Release Table A!
         return;
     }
 
@@ -903,7 +974,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
     }
 
     if (cached_num_cols == -1) {
-        send(client_sock, "ERROR|Table does not exist.\n", 28, 0); return;
+        send(client_sock, "ERROR|Table does not exist.\n", 28, 0); 
+        pthread_rwlock_unlock(t_lock);
+        return;
     }
 
     if (query->select_column_count > 0) {
@@ -914,7 +987,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             }
             if (!found) {
                 char err[128]; snprintf(err, 128, "ERROR|Column '%s' does not exist.\n", col_name);
-                send(client_sock, err, strlen(err), 0); return;
+                send(client_sock, err, strlen(err), 0); 
+                pthread_rwlock_unlock(t_lock);
+                return;
             }
         }
     }
@@ -1153,4 +1228,6 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
 
         free(results);
     }
+
+    pthread_rwlock_unlock(t_lock);
 }
