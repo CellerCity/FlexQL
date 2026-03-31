@@ -302,7 +302,7 @@ int execute_delete(const char* current_db, ParsedQuery* query) {
 }
 
 
-void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id, uint32_t* active_data_page, ParsedQuery* query, int client_sock) {
+int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id, uint32_t* active_data_page, ParsedQuery* query, int client_sock) {
     if (strlen(current_db) == 0) {
         send(client_sock, "ERROR|No database selected.\n", 28, 0); return -1;
     }
@@ -337,7 +337,7 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
         return -1;
     }
     
-    if (query->bulk_insert_ptr == NULL) return;
+    if (query->bulk_insert_ptr == NULL) return -1;
 
     char* ptr = query->bulk_insert_ptr;
     char tuple_buffer[MAX_TUPLE_SIZE];
@@ -380,26 +380,40 @@ void execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id
                     }
                 }
             }
-            // --------------------------
 
-            // Extract Primary Key for validation
-            IndexKey pk;
-            if (cached_types[0] == 1) {
-                if (!safe_parse_int(query->values[0], &pk.value.int_val)) goto type_err;
-                pk.type = 1;
-            } else if (cached_types[0] == 2) {
-                if (!safe_parse_double(query->values[0], &pk.value.dec_val)) goto type_err;
-                pk.type = 2;
-            } else {
-                pk.type = 4; strncpy(pk.value.str_val, query->values[0], 32);
+            // =========================================================
+            // DYNAMIC PK LOOKUP & HEAP TABLE DETECTION
+            // =========================================================
+            int pk_idx = 0; 
+            int has_pk = 0; 
+            for (int i = 0; i < cached_num_cols; i++) {
+                if (cached_schema[i].is_primary_key) { 
+                    pk_idx = i; 
+                    has_pk = 1; 
+                    break; 
+                }
             }
 
-            // SEMANTIC CONSTRAINT: Duplicate Key Check!
-            RecordID dummy;
-            if (btree_search(pager, *root_page_id, pk, &dummy)) {
-                const char* err = "ERROR|Duplicate Primary Key constraint violation.\n";
-                send(client_sock, err, strlen(err), 0);
-                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+            IndexKey pk;
+            if (has_pk) {
+                // Extract Primary Key for validation
+                if (cached_types[pk_idx] == 1) {
+                    if (!safe_parse_int(query->values[pk_idx], &pk.value.int_val)) goto type_err;
+                    pk.type = 1;
+                } else if (cached_types[pk_idx] == 2) {
+                    if (!safe_parse_double(query->values[pk_idx], &pk.value.dec_val)) goto type_err;
+                    pk.type = 2;
+                } else {
+                    pk.type = 4; strncpy(pk.value.str_val, query->values[pk_idx], 32);
+                }
+
+                // SEMANTIC CONSTRAINT: Duplicate Key Check! (ONLY IF WE HAVE A PK)
+                RecordID dummy;
+                if (btree_search(pager, *root_page_id, pk, &dummy)) {
+                    const char* err = "ERROR|Duplicate Primary Key constraint violation.\n";
+                    send(client_sock, err, strlen(err), 0);
+                    free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
+                }
             }
 
             // SEMANTIC CONSTRAINT: Type Safety Check!
@@ -411,8 +425,13 @@ type_err:
                 free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; return -1;
             }
 
+            // ALWAYS save to the hard drive (Data Page)
             RecordID record_location = append_to_data_page(pager, active_data_page, tuple_buffer, tuple_size);
-            btree_insert(pager, root_page_id, pk, record_location);
+            
+            // ONLY save to the Index (B-Tree) if the table has a Primary Key!
+            if (has_pk) {
+                btree_insert(pager, root_page_id, pk, record_location);
+            }
         }
         ptr++;
     }
@@ -420,7 +439,6 @@ type_err:
     free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
     return 0;
 }
-
 
 
 // --- HELPER STRUCTURES FOR TABLE SCANS & SORTING ---
@@ -505,9 +523,362 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
     if (strlen(current_db) == 0) {
         send(client_sock, "ERROR|No database selected.\n", 28, 0); return;
     }
+
+
+    
+    // =========================================================
+    // THE ULTIMATE INNER JOIN ENGINE (With WHERE & Fallbacks)
+    // =========================================================
     if (query->has_join) {
-        send(client_sock, "DONE|0 rows returned.\n", 22, 0); return;
+        char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
+
+        // 1. Load Schemas
+        ColumnDef schema_A[100]; int cols_A = load_schema(db_path, query->table_name, schema_A);
+        if (cols_A == -1) { send(client_sock, "ERROR|Left table missing.\n", 26, 0); return; }
+
+        ColumnDef schema_B[100]; int cols_B = load_schema(db_path, query->join_table, schema_B);
+        if (cols_B == -1) { send(client_sock, "ERROR|Right table missing.\n", 27, 0); return; }
+
+        // 2. Identify Join Columns
+        int join_idx_A = -1, join_idx_B = -1;
+        const char* base_left = get_base_col(query->join_condition_left);
+        const char* base_right = get_base_col(query->join_condition_right);
+        
+        for (int i = 0; i < cols_A; i++) if (strcasecmp(schema_A[i].name, base_left) == 0 || strcasecmp(schema_A[i].name, base_right) == 0) join_idx_A = i;
+        for (int i = 0; i < cols_B; i++) if (strcasecmp(schema_B[i].name, base_left) == 0 || strcasecmp(schema_B[i].name, base_right) == 0) join_idx_B = i;
+
+        if (join_idx_A == -1 || join_idx_B == -1) { send(client_sock, "ERROR|Join columns not found.\n", 30, 0); return; }
+
+        int type_join = 4;
+        if (strcasecmp(schema_A[join_idx_A].type, "INT") == 0) type_join = 1;
+        else if (strcasecmp(schema_A[join_idx_A].type, "DECIMAL") == 0) type_join = 2;
+        else if (strcasecmp(schema_A[join_idx_A].type, "DATETIME") == 0) type_join = 3;
+
+        // 3. Find the TRUE Primary Key indices in RAM
+        int pk_idx_A = -1, pk_idx_B = -1;
+        for (int i = 0; i < cols_A; i++) if (schema_A[i].is_primary_key) pk_idx_A = i;
+        for (int i = 0; i < cols_B; i++) if (schema_B[i].is_primary_key) pk_idx_B = i;
+
+        // 4. PREPARE THE WHERE CLAUSE FILTER (If applicable)
+        int has_where_A = 0, has_where_B = 0;
+        int where_idx = -1;
+        int where_type = 4;
+        
+        if (query->has_where) {
+            const char* w_col = get_base_col(query->where_column);
+            // Check if WHERE applies to Table A
+            for (int i = 0; i < cols_A; i++) {
+                if (strcasecmp(schema_A[i].name, w_col) == 0) {
+                    has_where_A = 1; where_idx = i;
+                    if (strcasecmp(schema_A[i].type, "INT") == 0) where_type = 1;
+                    else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) where_type = 2;
+                    else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) where_type = 3;
+                    break;
+                }
+            }
+            // If not in A, check Table B
+            if (!has_where_A) {
+                for (int i = 0; i < cols_B; i++) {
+                    if (strcasecmp(schema_B[i].name, w_col) == 0) {
+                        has_where_B = 1; where_idx = i;
+                        if (strcasecmp(schema_B[i].type, "INT") == 0) where_type = 1;
+                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) where_type = 2;
+                        else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) where_type = 3;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Open Table B's Pager
+        char path_B[512]; snprintf(path_B, sizeof(path_B), "%s/%s.dat", db_path, query->join_table);
+        Pager* pager_B = pager_open(path_B);
+        if (!pager_B) { send(client_sock, "ERROR|Failed to open right table.\n", 34, 0); return; }
+
+        char* net_ptr = net_buffer; int rows_sent = 0;
+
+        // =========================================================
+        // ROUTE 1A: Table B has the Primary Key! (Outer: A, Inner: B)
+        // =========================================================
+        if (pk_idx_B != -1 && join_idx_B == pk_idx_B) {
+            uint32_t root_id_B = 0; 
+            for (uint32_t pid_A = 1; pid_A < pager->num_pages; pid_A++) {
+                Page* page_A = get_page(pager, pid_A);
+                if (page_A->header.page_type == 0) {
+                    Slot* slots_A = (Slot*)page_A->data;
+                    for (int s_A = 0; s_A < page_A->header.num_slots; s_A++) {
+                        char* rec_A = &page_A->data[slots_A[s_A].offset - sizeof(PageHeader)];
+                        TupleHeader head_A; memcpy(&head_A, rec_A, sizeof(TupleHeader));
+                        if (head_A.expiration_timestamp < (uint64_t)time(NULL)) continue;
+
+                        uint16_t off_A = sizeof(TupleHeader);
+                        for(int i = 0; i < join_idx_A; i++) {
+                            if (strcasecmp(schema_A[i].type, "INT") == 0) off_A += 4;
+                            else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0 || strcasecmp(schema_A[i].type, "DATETIME") == 0) off_A += 8;
+                            else { uint16_t l; memcpy(&l, rec_A + off_A, 2); off_A += 2 + l; }
+                        }
+                        
+                        IndexKey search_key; search_key.type = type_join;
+                        if (type_join == 1) memcpy(&search_key.value.int_val, rec_A + off_A, 4);
+                        else if (type_join == 2) memcpy(&search_key.value.dec_val, rec_A + off_A, 8);
+                        else if (type_join == 3) memcpy(&search_key.value.dt_val, rec_A + off_A, 8);
+                        else {
+                            uint16_t str_len; memcpy(&str_len, rec_A + off_A, 2);
+                            int cp_len = str_len < 31 ? str_len : 31; memcpy(search_key.value.str_val, rec_A + off_A + 2, cp_len);
+                            search_key.value.str_val[cp_len] = '\0';
+                        }
+
+                        RecordID res_B;
+                        if (btree_search(pager_B, root_id_B, search_key, &res_B)) {
+                            Page* page_B = get_page(pager_B, res_B.page_num);
+                            Slot* slots_B = (Slot*)page_B->data;
+                            char* rec_B = &page_B->data[slots_B[res_B.slot_num].offset - sizeof(PageHeader)];
+                            TupleHeader head_B; memcpy(&head_B, rec_B, sizeof(TupleHeader));
+                            
+                            if (head_B.expiration_timestamp >= (uint64_t)time(NULL)) {
+                                
+                                // --- APPLY WHERE FILTER ---
+                                int passes_where = 1;
+                                if (has_where_A) {
+                                    uint16_t w_off = sizeof(TupleHeader);
+                                    for (int i=0; i<where_idx; i++) {
+                                        if (strcasecmp(schema_A[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0 || strcasecmp(schema_A[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_A + w_off, 2); w_off += 2 + l; }
+                                    }
+                                    passes_where = evaluate_condition(where_type, rec_A + w_off, query->where_operator, query->where_value);
+                                } else if (has_where_B) {
+                                    uint16_t w_off = sizeof(TupleHeader);
+                                    for (int i=0; i<where_idx; i++) {
+                                        if (strcasecmp(schema_B[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0 || strcasecmp(schema_B[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_B + w_off, 2); w_off += 2 + l; }
+                                    }
+                                    passes_where = evaluate_condition(where_type, rec_B + w_off, query->where_operator, query->where_value);
+                                }
+
+                                if (passes_where) {
+                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
+                                    uint16_t out_A = sizeof(TupleHeader);
+                                    for (int i = 0; i < cols_A; i++) {
+                                        *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                        if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
+                                        else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
+                                        else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
+                                        else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
+                                    }
+                                    uint16_t out_B = sizeof(TupleHeader);
+                                    for (int i = 0; i < cols_B; i++) {
+                                        *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                        if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
+                                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
+                                        else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
+                                        else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
+                                    }
+                                    *net_ptr++ = '\n'; rows_sent++;
+                                    if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
+                                }
+                            }
+                            unpin_page(pager_B, res_B.page_num, 0);
+                        }
+                    }
+                }
+                unpin_page(pager, pid_A, 0);
+            }
+        }
+        // =========================================================
+        // ROUTE 1B: Table A has the Primary Key! (Outer: B, Inner: A)
+        // =========================================================
+        else if (pk_idx_A != -1 && join_idx_A == pk_idx_A) {
+            
+            for (uint32_t pid_B = 1; pid_B < pager_B->num_pages; pid_B++) {
+                Page* page_B = get_page(pager_B, pid_B);
+                if (page_B->header.page_type == 0) {
+                    Slot* slots_B = (Slot*)page_B->data;
+                    for (int s_B = 0; s_B < page_B->header.num_slots; s_B++) {
+                        char* rec_B = &page_B->data[slots_B[s_B].offset - sizeof(PageHeader)];
+                        TupleHeader head_B; memcpy(&head_B, rec_B, sizeof(TupleHeader));
+                        if (head_B.expiration_timestamp < (uint64_t)time(NULL)) continue;
+
+                        uint16_t off_B = sizeof(TupleHeader);
+                        for(int i = 0; i < join_idx_B; i++) {
+                            if (strcasecmp(schema_B[i].type, "INT") == 0) off_B += 4;
+                            else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0 || strcasecmp(schema_B[i].type, "DATETIME") == 0) off_B += 8;
+                            else { uint16_t l; memcpy(&l, rec_B + off_B, 2); off_B += 2 + l; }
+                        }
+                        
+                        IndexKey search_key; search_key.type = type_join;
+                        if (type_join == 1) memcpy(&search_key.value.int_val, rec_B + off_B, 4);
+                        else if (type_join == 2) memcpy(&search_key.value.dec_val, rec_B + off_B, 8);
+                        else if (type_join == 3) memcpy(&search_key.value.dt_val, rec_B + off_B, 8);
+                        else {
+                            uint16_t str_len; memcpy(&str_len, rec_B + off_B, 2);
+                            int cp_len = str_len < 31 ? str_len : 31; memcpy(search_key.value.str_val, rec_B + off_B + 2, cp_len);
+                            search_key.value.str_val[cp_len] = '\0';
+                        }
+
+                        RecordID res_A;
+                        if (btree_search(pager, root_page_id, search_key, &res_A)) {
+                            Page* page_A = get_page(pager, res_A.page_num);
+                            Slot* slots_A = (Slot*)page_A->data;
+                            char* rec_A = &page_A->data[slots_A[res_A.slot_num].offset - sizeof(PageHeader)];
+                            TupleHeader head_A; memcpy(&head_A, rec_A, sizeof(TupleHeader));
+                            
+                            if (head_A.expiration_timestamp >= (uint64_t)time(NULL)) {
+                                
+                                // --- APPLY WHERE FILTER ---
+                                int passes_where = 1;
+                                if (has_where_A) {
+                                    uint16_t w_off = sizeof(TupleHeader);
+                                    for (int i=0; i<where_idx; i++) {
+                                        if (strcasecmp(schema_A[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0 || strcasecmp(schema_A[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_A + w_off, 2); w_off += 2 + l; }
+                                    }
+                                    passes_where = evaluate_condition(where_type, rec_A + w_off, query->where_operator, query->where_value);
+                                } else if (has_where_B) {
+                                    uint16_t w_off = sizeof(TupleHeader);
+                                    for (int i=0; i<where_idx; i++) {
+                                        if (strcasecmp(schema_B[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0 || strcasecmp(schema_B[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_B + w_off, 2); w_off += 2 + l; }
+                                    }
+                                    passes_where = evaluate_condition(where_type, rec_B + w_off, query->where_operator, query->where_value);
+                                }
+
+                                if (passes_where) {
+                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
+                                    uint16_t out_A = sizeof(TupleHeader);
+                                    for (int i = 0; i < cols_A; i++) {
+                                        *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                        if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
+                                        else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
+                                        else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
+                                        else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
+                                    }
+                                    uint16_t out_B = sizeof(TupleHeader);
+                                    for (int i = 0; i < cols_B; i++) {
+                                        *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                        if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
+                                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
+                                        else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
+                                        else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
+                                    }
+                                    *net_ptr++ = '\n'; rows_sent++;
+                                    if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
+                                }
+                            }
+                            unpin_page(pager, res_A.page_num, 0);
+                        }
+                    }
+                }
+                unpin_page(pager_B, pid_B, 0);
+            }
+        }
+        // =========================================================
+        // ROUTE 2: BLOCK NESTED LOOP JOIN (Fallback for non-indexed tables)
+        // =========================================================
+        else {
+            for (uint32_t pid_A = 1; pid_A < pager->num_pages; pid_A++) {
+                Page* page_A = get_page(pager, pid_A);
+                if (page_A->header.page_type == 0) {
+                    Slot* slots_A = (Slot*)page_A->data;
+                    for (int s_A = 0; s_A < page_A->header.num_slots; s_A++) {
+                        char* rec_A = &page_A->data[slots_A[s_A].offset - sizeof(PageHeader)];
+                        TupleHeader head_A; memcpy(&head_A, rec_A, sizeof(TupleHeader));
+                        if (head_A.expiration_timestamp < (uint64_t)time(NULL)) continue;
+
+                        uint16_t off_A = sizeof(TupleHeader);
+                        for(int i = 0; i < join_idx_A; i++) {
+                            if (strcasecmp(schema_A[i].type, "INT") == 0) off_A += 4;
+                            else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0 || strcasecmp(schema_A[i].type, "DATETIME") == 0) off_A += 8;
+                            else { uint16_t l; memcpy(&l, rec_A + off_A, 2); off_A += 2 + l; }
+                        }
+                        char* val_A_ptr = rec_A + off_A;
+
+                        // Scan Table B
+                        for (uint32_t pid_B = 1; pid_B < pager_B->num_pages; pid_B++) {
+                            Page* page_B = get_page(pager_B, pid_B);
+                            if (page_B->header.page_type == 0) {
+                                Slot* slots_B = (Slot*)page_B->data;
+                                for (int s_B = 0; s_B < page_B->header.num_slots; s_B++) {
+                                    char* rec_B = &page_B->data[slots_B[s_B].offset - sizeof(PageHeader)];
+                                    TupleHeader head_B; memcpy(&head_B, rec_B, sizeof(TupleHeader));
+                                    if (head_B.expiration_timestamp < (uint64_t)time(NULL)) continue;
+
+                                    uint16_t off_B = sizeof(TupleHeader);
+                                    for(int i = 0; i < join_idx_B; i++) {
+                                        if (strcasecmp(schema_B[i].type, "INT") == 0) off_B += 4;
+                                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0 || strcasecmp(schema_B[i].type, "DATETIME") == 0) off_B += 8;
+                                        else { uint16_t l; memcpy(&l, rec_B + off_B, 2); off_B += 2 + l; }
+                                    }
+                                    char* val_B_ptr = rec_B + off_B;
+
+                                    // COMPARE
+                                    int match = 0;
+                                    if (type_join == 1) {
+                                        int32_t a, b; memcpy(&a, val_A_ptr, 4); memcpy(&b, val_B_ptr, 4); match = (a == b);
+                                    } else if (type_join == 2 || type_join == 3) {
+                                        int64_t a, b; memcpy(&a, val_A_ptr, 8); memcpy(&b, val_B_ptr, 8); match = (a == b);
+                                    } else {
+                                        uint16_t lenA, lenB; memcpy(&lenA, val_A_ptr, 2); memcpy(&lenB, val_B_ptr, 2);
+                                        if (lenA == lenB && memcmp(val_A_ptr + 2, val_B_ptr + 2, lenA) == 0) match = 1;
+                                    }
+
+                                    if (match) {
+                                        // --- APPLY WHERE FILTER ---
+                                        int passes_where = 1;
+                                        if (has_where_A) {
+                                            uint16_t w_off = sizeof(TupleHeader);
+                                            for (int i=0; i<where_idx; i++) {
+                                                if (strcasecmp(schema_A[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0 || strcasecmp(schema_A[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_A + w_off, 2); w_off += 2 + l; }
+                                            }
+                                            passes_where = evaluate_condition(where_type, rec_A + w_off, query->where_operator, query->where_value);
+                                        } else if (has_where_B) {
+                                            uint16_t w_off = sizeof(TupleHeader);
+                                            for (int i=0; i<where_idx; i++) {
+                                                if (strcasecmp(schema_B[i].type, "INT") == 0) w_off += 4; else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0 || strcasecmp(schema_B[i].type, "DATETIME") == 0) w_off += 8; else { uint16_t l; memcpy(&l, rec_B + w_off, 2); w_off += 2 + l; }
+                                            }
+                                            passes_where = evaluate_condition(where_type, rec_B + w_off, query->where_operator, query->where_value);
+                                        }
+
+                                        if (passes_where) {
+                                            net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
+                                            uint16_t out_A = sizeof(TupleHeader);
+                                            for (int i = 0; i < cols_A; i++) {
+                                                *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                                if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
+                                                else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
+                                                else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
+                                                else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
+                                            }
+                                            uint16_t out_B = sizeof(TupleHeader);
+                                            for (int i = 0; i < cols_B; i++) {
+                                                *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
+                                                if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
+                                                else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
+                                                else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
+                                                else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
+                                            }
+                                            *net_ptr++ = '\n'; rows_sent++;
+                                            if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
+                                        }
+                                    }
+                                }
+                            }
+                            unpin_page(pager_B, pid_B, 0);
+                        }
+                    }
+                }
+                unpin_page(pager, pid_A, 0);
+            }
+        }
+
+        if (net_ptr > net_buffer) send(client_sock, net_buffer, net_ptr - net_buffer, 0);
+        
+        char done_msg[128]; snprintf(done_msg, sizeof(done_msg), "DONE|%d rows returned from Join.\n", rows_sent);
+        send(client_sock, done_msg, strlen(done_msg), 0);
+        
+        pager_close(pager_B);
+        return;
     }
+
+
+
+
+
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
@@ -548,16 +919,32 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         }
     }
 
+    
+    // =========================================================
+    // DYNAMIC PK LOOKUP & HEAP TABLE DETECTION
+    // =========================================================
+    int pk_idx = 0; 
+    int has_pk = 0; 
+    for (int i = 0; i < cached_num_cols; i++) {
+        if (cached_schema[i].is_primary_key) { pk_idx = i; has_pk = 1; break; }
+    }
+
     int cols_to_send = query->select_column_count == 0 ? cached_num_cols : query->select_column_count;
+    
     int use_btree = 0;
     const char* w_col = query->has_where ? get_base_col(query->where_column) : "";
-    if (query->has_where && strcasecmp(w_col, cached_schema[0].name) == 0 && strcmp(query->where_operator, "=") == 0) use_btree = 1; 
+    
+    // Trigger B-Tree ONLY if the table actually HAS a primary key, AND they search on it!
+    if (has_pk && query->has_where && strcasecmp(w_col, cached_schema[pk_idx].name) == 0 && strcmp(query->where_operator, "=") == 0) {
+        use_btree = 1; 
+    }
+
 
     if (use_btree) {
         IndexKey search_key;
-        if (cached_types[0] == 1) { search_key.type = 1; search_key.value.int_val = atoi(query->where_value); } 
-        else if (cached_types[0] == 2) { search_key.type = 2; search_key.value.dec_val = atof(query->where_value); }
-        else if (cached_types[0] == 3) { 
+        if (cached_types[pk_idx] == 1) { search_key.type = 1; search_key.value.int_val = atoi(query->where_value); } 
+        else if (cached_types[pk_idx] == 2) { search_key.type = 2; search_key.value.dec_val = atof(query->where_value); }
+        else if (cached_types[pk_idx] == 3) { 
             search_key.type = 3; 
             struct tm tm_info; memset(&tm_info, 0, sizeof(struct tm));
             if (strptime(query->where_value, "%Y-%m-%d %H:%M:%S", &tm_info) != NULL ||

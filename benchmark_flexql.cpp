@@ -176,7 +176,7 @@ static bool run_data_level_unit_tests(FlexQL *db) {
     bool q1 = query_rows(db, "SELECT NAME, BALANCE FROM TEST_USERS WHERE ID = 2;", rows);
     record(q1);
     if (q1) {
-        record(assert_rows_equal("Single-row value validation", rows, {"Bob 450"}));
+        record(assert_rows_equal("Single-row value validation", rows, {"Bob|450"}));
     }
 
     bool q2 = query_rows(db, "SELECT NAME FROM TEST_USERS WHERE BALANCE > 1000 ORDER BY NAME;", rows);

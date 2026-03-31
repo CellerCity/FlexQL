@@ -85,29 +85,23 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void*, int, char**,
                         int col_count = atoi(col_count_str);
                         char **colNames = (char**)malloc(col_count * sizeof(char*));
                         char **values = (char**)malloc(col_count * sizeof(char*));
+                        
+                        // Extract the columns from the TCP packet (ONLY ONCE!)
                         for (int i = 0; i < col_count; i++) {
                             colNames[i] = strtok_r(NULL, "|", &saveptr_col);
                             values[i] = strtok_r(NULL, "|", &saveptr_col);
                         }
                         
-                        int abort_flag;
-                        if (col_count > 1) { // TA Bug Workaround
-                            char combined[2048] = "";
-                            for (int i = 0; i < col_count; i++) {
-                                strcat(combined, values[i]);
-                                if (i < col_count - 1) strcat(combined, " ");
-                            }
-                            char *single_val[1] = { combined };
-                            char *single_col[1] = { "RESULT" };
-                            abort_flag = callback(arg, 1, single_val, single_col);
-                        } else {
-                            abort_flag = callback(arg, col_count, values, colNames);
-                        }
-                        free(colNames); free(values);
-                        if (abort_flag == 1) return FLEXQL_OK; 
+                        // Execute the TA's callback
+                        int abort_flag = callback(arg, col_count, values, colNames);
+                        
+                        free(colNames); 
+                        free(values);
+                        
+                        if (abort_flag == 1) return FLEXQL_OK;
                     }
                 }
-            } 
+            }
             line = strtok_r(NULL, "\n", &saveptr_line);
         }
     }
