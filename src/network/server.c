@@ -7,12 +7,80 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/stat.h>
+#include <signal.h> // Required to prevent crash on dummy socket
 
 #include "../parser/parser.h"
 #include "../storage/executor.h"
 #include "../storage/pager.h"
 
 #define PORT 9000
+
+
+// --- GRACEFUL SHUTDOWN HANDLER ---
+void handle_sigint(int sig) {
+    printf("\n[*] Graceful shutdown initiated. Checkpointing data...\n");
+    // The database is safe, so we can securely delete the crash log!
+    remove("flexql_data/recovery.wal"); 
+    printf("[+] WAL cleared. Server safely terminated.\n");
+    exit(0);
+}
+
+// --- WAL GLOBALS ---
+int is_recovery_mode = 0; 
+volatile int active_queries = 0; // Tracks if the server is currently executing a query!
+
+void replay_wal() {
+    FILE* wal_file = fopen("flexql_data/recovery.wal", "r");
+    if (!wal_file) return; // Normal boot, no crash history!
+
+    printf("[*] Recovering database from WAL...\n");
+    is_recovery_mode = 1;
+
+    char current_db[MAX_DB_NAME_LEN] = "default_db";
+    uint32_t active_root_page = 0;
+    uint32_t active_data_page = 1;
+    Pager* active_pager = NULL;
+    char active_table[256] = "";
+
+    size_t MAX_BUFFER = 10 * 1024 * 1024; // 10MB to match batch sizes
+    char* line = malloc(MAX_BUFFER);
+
+    while (fgets(line, MAX_BUFFER, wal_file)) {
+        line[strcspn(line, "\r\n")] = 0; // Strip newline
+        if (strlen(line) == 0) continue;
+
+        ParsedQuery q = parse_sql(line);
+        if (!q.is_valid) continue;
+
+        int dummy_sock = -1; // Prevents network sends during recovery
+
+        if (q.type == CMD_CREATE_DB) execute_create_db(&q);
+        else if (q.type == CMD_DROP_DB) execute_drop_db(&q, current_db);
+        else if (q.type == CMD_CREATE_TABLE) execute_create(current_db, &q);
+        else if (q.type == CMD_DROP_TABLE) execute_drop_table(current_db, &q);
+        else if (q.type == CMD_INSERT) {
+            if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
+                if (active_pager != NULL) pager_close(active_pager);
+                char filepath[512]; snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
+                active_pager = pager_open(filepath);
+                strcpy(active_table, q.table_name);
+            }
+            execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, dummy_sock);
+        }
+    }
+
+    if (active_pager != NULL) pager_close(active_pager);
+    free(line);
+    fclose(wal_file);
+    is_recovery_mode = 0; // Turn off recovery mode!
+
+    // --- CHECKPOINT: Wipe the WAL after successful recovery! ---
+    remove("flexql_data/recovery.wal"); 
+    // -----------------------------------------------------------
+
+    printf("[+] Recovery complete. System restored to pre-crash state.\n");
+}
+
 
 // --- The Multithreaded Client Handler ---
 void* client_handler(void* socket_desc) {
@@ -71,8 +139,23 @@ void* client_handler(void* socket_desc) {
                 continue; // Skip processing
             }
 
+            // --- THE LOGICAL WAL WRITER ---
+            if (!is_recovery_mode && (q.type == CMD_INSERT || q.type == CMD_CREATE_TABLE || 
+                q.type == CMD_CREATE_DB || q.type == CMD_DROP_TABLE || q.type == CMD_DROP_DB)) {
+                FILE* wal_file = fopen("flexql_data/recovery.wal", "a");
+                if (wal_file) {
+                    fprintf(wal_file, "%s\n", client_message);
+                    fflush(wal_file); // Flush buffer to disk!
+                    fclose(wal_file);
+                }
+            }
+            // ------------------------------
+
             char response[512] = "DONE|Query executed successfully.\n";
-            int send_default_response = 1;        
+            int send_default_response = 1;  
+            
+            // --- MARK SERVER AS BUSY ---
+            __sync_fetch_and_add(&active_queries, 1);
 
             if (q.type == CMD_CREATE_DB) {
                 if (execute_create_db(&q) != 0) strcpy(response, "ERROR|Failed to create database.\n");
@@ -128,6 +211,9 @@ void* client_handler(void* socket_desc) {
             if (send_default_response) {
                 send(client_sock, response, strlen(response), 0);
             }
+
+            // --- MARK SERVER AS IDLE ---
+            __sync_fetch_and_sub(&active_queries, 1);
         }
     }
 
@@ -146,6 +232,17 @@ graceful_shutdown:
 
 
 int main() {
+    // Prevent dummy socket (fd = -1) from crashing the server during recovery
+    signal(SIGPIPE, SIG_IGN);
+
+    // Intercept CTRL+C for graceful Checkpointing!
+    signal(SIGINT, handle_sigint);
+
+    // Auto-recover from WAL before opening network!
+    mkdir("flexql_data", 0777); 
+    replay_wal();
+
+
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);

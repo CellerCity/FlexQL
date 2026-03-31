@@ -14,6 +14,8 @@
 #include <sys/socket.h>
 #include <pthread.h>
 
+extern int is_recovery_mode; // Link to the flag in server.c
+
 // =========================================================
 // TABLE-LEVEL CONCURRENCY CONTROL (Lock Manager)
 // =========================================================
@@ -91,7 +93,7 @@ int execute_use_db(ParsedQuery* query, char* current_db_session) {
 }
 
 int execute_drop_db(ParsedQuery* query, char* current_db_session) {
-    char cmd[512]; char filepath[512];
+    char cmd[1024]; char filepath[1024];
     snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, query->db_name);
 
     struct stat st = {0};
@@ -125,7 +127,7 @@ void execute_show_db(int client_sock) {
     if (d) {
         while ((dir = readdir(d)) != NULL) {
             if (dir->d_type == DT_DIR && strcmp(dir->d_name, ".") != 0 && strcmp(dir->d_name, "..") != 0) {
-                char row[256];
+                char row[512];
                 snprintf(row, sizeof(row), "ROW|1|Database|%s\n", dir->d_name);
                 strcat(buffer, row);
             }
@@ -149,7 +151,7 @@ void execute_show_tables(const char* current_db, int client_sock) {
     if (d) {
         while ((dir = readdir(d)) != NULL) {
             if (strstr(dir->d_name, ".schema")) {
-                char row[256]; char t_name[256];
+                char row[512]; char t_name[512];
                 strcpy(t_name, dir->d_name);
                 t_name[strlen(t_name) - 7] = '\0'; // Remove .schema
                 snprintf(row, sizeof(row), "ROW|1|Table|%s\n", t_name);
@@ -298,13 +300,22 @@ int execute_create(const char* current_db, ParsedQuery* query) {
     ensure_sandbox();
     if (strlen(current_db) == 0) return -1;
 
-    char path[512];
+    char path[1024]; // Increased size to silence GCC warning
     snprintf(path, sizeof(path), "%s/%s", DATA_DIR, current_db);
     mkdir(path, 0777); 
     
+    char filepath[1024]; // Increased size to silence GCC warning
+    snprintf(filepath, sizeof(filepath), "%s/%s.dat", path, query->table_name);
+    
+    // --- THE IDEMPOTENT CREATE FIX ---
+    // If booting up and the file exists, it survived the crash! Skip wiping it!
+    if (is_recovery_mode) {
+        struct stat st = {0};
+        if (stat(filepath, &st) == 0) return 0; 
+    }
+    // ---------------------------------
+
     if (save_schema(path, query->table_name, query->columns, query->column_count) == 0) {
-        char filepath[512];
-        snprintf(filepath, sizeof(filepath), "%s/%s.dat", path, query->table_name);
         Pager* pager = pager_open(filepath);
         Page* root_page = get_page(pager, 0);
         root_page->header.page_type = 1;
@@ -453,6 +464,15 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
                 // SEMANTIC CONSTRAINT: Duplicate Key Check! (ONLY IF WE HAVE A PK)
                 RecordID dummy;
                 if (btree_search(pager, *root_page_id, pk, &dummy)) {
+
+                    // --- IDEMPOTENT REPLAY ---
+                    // If we are booting up, and the B-Tree already has this ID, 
+                    // it means this row survived the crash! Skip it safely!
+                    if (is_recovery_mode) {
+                        continue; 
+                    }
+                    // -------------------------
+
                     const char* err = "ERROR|Duplicate Primary Key constraint violation.\n";
                     send(client_sock, err, strlen(err), 0);
                     free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
@@ -656,7 +676,7 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         }
 
         // Open Table B's Pager
-        char path_B[512]; snprintf(path_B, sizeof(path_B), "%s/%s.dat", db_path, query->join_table);
+        char path_B[1024]; snprintf(path_B, sizeof(path_B), "%s/%s.dat", db_path, query->join_table);
         Pager* pager_B = pager_open(path_B);
         if (!pager_B) { 
             send(client_sock, "ERROR|Failed to open right table.\n", 34, 0); 
