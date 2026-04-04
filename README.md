@@ -129,19 +129,6 @@ To ensure production-grade stability, I developed a suite of automated stress te
 
 
 
-That is an incredibly sharp observation! Yes, you should absolutely include this in your README. In fact, documenting this elevates your project from a simple coding assignment to a professional-grade systems engineering report.
-
-What you are experiencing is a classic benchmarking "gotcha." Software performance does not exist in a vacuum; it is heavily dictated by the operating system's hardware management. 
-
-Here is exactly what is happening under the hood:
-
-* **CPU Frequency Scaling:** When your HP Omen is running on battery, Ubuntu's power management daemon automatically switches the CPU governor from `performance` to `powersave`. This aggressively downclocks your processor and disables Turbo Boost to conserve energy, starving your database engine of the raw clock cycles it needs for parsing and B-Tree traversals.
-* **I/O Throttling:** Operating systems often throttle disk write speeds on battery power to prevent the storage controller from drawing peak wattage. Since your Write-Ahead Log and Data Pages are writing heavily to the disk, this bottleneck stacks with the CPU throttling.
-
-Professional database benchmarks (like the ones published for PostgreSQL or MySQL) always explicitly define their hardware environment and power states to ensure the results are reproducible.
-
-Here is a professionally worded snippet you can drop right into an "Extras" or "Benchmarking Methodology" section of your README:
-
 ***
 
 
