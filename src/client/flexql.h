@@ -12,8 +12,6 @@ extern "C" {
 // Opaque structure - the user never sees what is inside this!
 typedef struct FlexQL FlexQL;
 
-// --- Required Client APIs ---
-
 // Establishes a connection to the FlexQL database server.
 int flexql_open(const char *host, int port, FlexQL **db);
 

@@ -122,10 +122,13 @@ int execute_drop_table(const char* current_db, ParsedQuery* query) {
 void execute_show_db(int client_sock) {
     ensure_sandbox();
     DIR *d; struct dirent *dir;
-    char buffer[4096] = "ROW|1|Database\n";
+    char buffer[4096] = "";
     d = opendir(DATA_DIR);
     if (d) {
         while ((dir = readdir(d)) != NULL) {
+            // --- Ignore hidden files, ., .., and the WAL file ---
+            if (dir->d_name[0] == '.') continue; 
+            if (strstr(dir->d_name, "recovery.wal") != NULL) continue;
             if (dir->d_type == DT_DIR && strcmp(dir->d_name, ".") != 0 && strcmp(dir->d_name, "..") != 0) {
                 char row[512];
                 snprintf(row, sizeof(row), "ROW|1|Database|%s\n", dir->d_name);
@@ -146,10 +149,14 @@ void execute_show_tables(const char* current_db, int client_sock) {
     snprintf(filepath, sizeof(filepath), "%s/%s", DATA_DIR, current_db);
     
     DIR *d; struct dirent *dir;
-    char buffer[4096] = "ROW|1|Table\n";
+    char buffer[4096] = "";
     d = opendir(filepath);
     if (d) {
         while ((dir = readdir(d)) != NULL) {
+            // --- Ignore hidden files, ., .., and the WAL file ---
+            if (dir->d_name[0] == '.') continue; 
+            if (strstr(dir->d_name, "recovery.wal") != NULL) continue;
+
             if (strstr(dir->d_name, ".schema")) {
                 char row[512]; char t_name[512];
                 strcpy(t_name, dir->d_name);
