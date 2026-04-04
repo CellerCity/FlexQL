@@ -65,7 +65,7 @@ int main(int argc, char *argv[]) {
         if (strlen(input) == 0) continue; 
 
         // Send query synchronously
-        char network_query[2048];
+        char network_query[4096]; 
         snprintf(network_query, sizeof(network_query), "%s\n", input);
         if (send(sock, network_query, strlen(network_query), 0) < 0) break;
 

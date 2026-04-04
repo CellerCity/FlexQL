@@ -2,7 +2,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
-#include "./src/client/flexql.h"
+#include "../src/client/flexql.h"
 
 using namespace std;
 

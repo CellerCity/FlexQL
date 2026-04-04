@@ -108,12 +108,12 @@ void lru_evict(Pager* pager) {
     if (pager->head != NULL) pager->head->prev = NULL;
     else pager->tail = NULL;
 
+    pager->current_cache_size--;
+    
+    pthread_rwlock_destroy(&evict_node->page_lock); // Destroy the lock before freeing
+    
     free(evict_node->page_data);
     free(evict_node);
-    pager->current_cache_size--;
-
-
-    pthread_rwlock_destroy(&evict_node->page_lock); // Destroy the lock before freeing
 }
 
 // --- 4. The Core Logic: Get Page ---

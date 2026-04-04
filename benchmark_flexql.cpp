@@ -15,6 +15,7 @@ struct QueryStats {
     long long rows = 0;
 };
 
+/*
 static int count_rows_callback(void *data, int argc, char **argv, char **azColName) {
     (void)argc;
     (void)argv;
@@ -25,6 +26,7 @@ static int count_rows_callback(void *data, int argc, char **argv, char **azColNa
     }
     return 0;
 }
+*/
 
 static bool run_exec(FlexQL *db, const string &sql, const string &label) {
     char *errMsg = nullptr;
@@ -45,6 +47,7 @@ static bool run_exec(FlexQL *db, const string &sql, const string &label) {
     return true;
 }
 
+/*
 static bool run_query(FlexQL *db, const string &sql, const string &label) {
     QueryStats stats;
     char *errMsg = nullptr;
@@ -52,7 +55,7 @@ static bool run_query(FlexQL *db, const string &sql, const string &label) {
     int rc = flexql_exec(db, sql.c_str(), count_rows_callback, &stats, &errMsg);
     auto end = high_resolution_clock::now();
     long long elapsed = duration_cast<milliseconds>(end - start).count();
-
+    
     if (rc != FLEXQL_OK) {
         cout << "[FAIL] " << label << " -> " << (errMsg ? errMsg : "unknown error") << "\n";
         if (errMsg) {
@@ -60,10 +63,11 @@ static bool run_query(FlexQL *db, const string &sql, const string &label) {
         }
         return false;
     }
-
+    
     cout << "[PASS] " << label << " | rows=" << stats.rows << " | " << elapsed << " ms\n";
     return true;
 }
+*/
 
 static bool query_rows(FlexQL *db, const string &sql, vector<string> &out_rows) {
     struct Collector {
