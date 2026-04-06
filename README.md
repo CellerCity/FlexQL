@@ -140,7 +140,7 @@ To ensure our benchmarking methodology is completely standardized and reproducib
 This script automatically cycles the database through a matrix of hardware states (Plugged-In vs. Battery) and OS CPU Governors (Performance, Balanced, Power Saver). For each state, it wipes the data directory, boots the server, blasts 1M and 10M rows, kills the server, and logs the output. Finally, an embedded `awk` scraper parses the raw logs and automatically generates a formatted Markdown table of our throughput metrics.
 
 **The "Why" Behind Power State Variance:**
-During profiling, we observed a massive 2x to 3x performance drop when running the benchmarks on battery power versus wall power. This is caused by the operating system's Advanced Configuration and Power Interface (ACPI) policies. 
+During profiling, we observed a massive 2x performance drop when running the benchmarks on battery power versus wall power. This is caused by the operating system's Advanced Configuration and Power Interface (ACPI) policies. 
 * On battery power, the Linux kernel aggressively switches the CPU governor from `performance` to `powersave`. 
 * This disables CPU Turbo Boost, heavily downclocks core frequencies, and throttles hard-drive I/O to conserve wattage. 
 * Because FlexQL processes data at such high velocity, it immediately bottlenecks against these artificial OS limits. For maximum throughput, the host machine must be on wall power with the `performance` governor explicitly enabled.
