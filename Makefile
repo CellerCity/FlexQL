@@ -18,6 +18,8 @@ RIGOROUS_BIN = rigorous_tests
 # Build Rules
 # ==========================================
 
+.PHONY: all server client benchmark tests scripts clean
+
 # The default 'make' command builds everything and makes scripts executable
 all: server client benchmark tests scripts
 
