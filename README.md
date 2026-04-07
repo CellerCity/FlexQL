@@ -66,6 +66,144 @@ Our codebase is organized to enforce a strict separation of concerns:
 
 ---
 
+
+
+## 2.1 Example Usage – REPL Client
+
+After starting the server and client, we can execute SQL‑like commands. The system includes a `default_db` database that is used automatically if no database is selected.
+
+### Basic Commands
+
+```sql
+-- Create a new database
+CREATE DATABASE school;
+
+-- Switch to a database
+USE school;
+
+-- Create two tables
+CREATE TABLE students (id INT, name VARCHAR, grade DECIMAL);
+CREATE TABLE courses (student_id INT, course_name VARCHAR, score INT);
+
+INSERT INTO students VALUES (1, 'Alice', 85.5);
+INSERT INTO students VALUES (2, 'Bob', 92.0);
+INSERT INTO students VALUES (3, 'Carol', 78.0);
+
+INSERT INTO courses VALUES (1, 'Math', 90);
+INSERT INTO courses VALUES (1, 'Physics', 85);
+INSERT INTO courses VALUES (2, 'Math', 95);
+INSERT INTO courses VALUES (3, 'Chemistry', 70);
+```
+
+### SELECT with WHERE and Comparison Operators
+
+You can use `=`, `>`, `>=`, `<`, `<=`, `<>` in the `WHERE` clause.
+
+```sql
+-- Students with grade >= 80
+SELECT * FROM students WHERE grade >= 80;
+```
+**Expected output:**
+```
+id = 1
+name = Alice
+grade = 85.5
+
+id = 2
+name = Bob
+grade = 92.0
+```
+
+```sql
+-- Students with grade < 80
+SELECT name FROM students WHERE grade < 80;
+```
+**Expected output:**
+```
+name = Carol
+```
+
+```sql
+-- Students with id <= 2
+SELECT id, name FROM students WHERE id <= 2;
+```
+**Expected output:**
+```
+id = 1
+name = Alice
+
+id = 2
+name = Bob
+```
+
+
+### INNER JOIN with WHERE Clause
+
+```sql
+-- Join with filter on the joined table
+SELECT * FROM students
+INNER JOIN courses ON students.id = courses.student_id
+WHERE courses.score > 85;
+```
+**Expected output:**
+```
+
+id = 1
+name = Alice grade = 85.5 
+student_id = 1
+course_name = Math 
+score = 90
+
+id = 1
+name = Alice grade = 85.5 
+student_id = 1
+course_name = Physics 
+score = 85
+
+id = 2
+name = Bob grade = 92.0 
+student_id = 2
+course_name = Math 
+score = 95
+```
+
+### Working Without a Selected Database
+
+If you never issue `USE <dbname>`, all operations run inside the `default_db` database, which is created automatically.
+
+```sql
+-- These commands work even without USE
+CREATE TABLE test (id INT);
+INSERT INTO test VALUES (10);
+SELECT * FROM test;
+```
+
+### Other Useful Commands
+
+```sql
+-- Show all databases
+SHOW DATABASES;
+
+-- Show tables in current database
+SHOW TABLES;
+
+-- Drop a table
+DROP TABLE students;
+
+-- Exit the client
+.exit
+```
+
+### Important Notes
+
+- Primary keys are automatically indexed using a B+ Tree.
+- The client supports batched inserts for high throughput (with a batch size upto 5000 per insert statement).
+
+---
+
+
+
+
 ## 3. Core Design Decisions
 
 ### 3.1 How the Data is Stored
