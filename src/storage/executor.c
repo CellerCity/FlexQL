@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <unistd.h>
 
 extern int is_recovery_mode; // Link to the flag in server.c
 
@@ -314,13 +315,19 @@ int execute_create(const char* current_db, ParsedQuery* query) {
     char filepath[1024]; // Increased size to silence GCC warning
     snprintf(filepath, sizeof(filepath), "%s/%s.dat", path, query->table_name);
     
-    // --- THE IDEMPOTENT CREATE FIX ---
-    // If booting up and the file exists, it survived the crash! Skip wiping it!
-    if (is_recovery_mode) {
-        struct stat st = {0};
-        if (stat(filepath, &st) == 0) return 0; 
+    // --- THE COMBINED OVERWRITE & RECOVERY FIX ---
+    // Check if the table's .dat file already exists using POSIX access()
+    if (access(filepath, F_OK) == 0) {
+        if (is_recovery_mode) {
+            // It survived the crash! Skip wiping it and return success for the WAL.
+            return 0; 
+        } else {
+            // A live client is trying to overwrite an existing table. Abort!
+            // Return -2 to signal a "Table Already Exists" conflict to the caller.
+            return -2; 
+        }
     }
-    // ---------------------------------
+    // ---------------------------------------------
 
     if (save_schema(path, query->table_name, query->columns, query->column_count) == 0) {
         Pager* pager = pager_open(filepath);
