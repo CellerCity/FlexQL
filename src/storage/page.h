@@ -32,10 +32,7 @@ typedef struct {
     
     // This points to the start of the unallocated space. 
     // It starts at 4096 and shrinks downwards as we insert data at the bottom.
-    uint16_t free_space_ptr; 
-    
-    // To satisfy the assignment's concurrency requirements later, 
-    // we can add an atomic lock flag here, but we will leave it simple for now.
+    uint16_t free_space_ptr;
 } PageHeader;
 
 /*

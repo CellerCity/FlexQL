@@ -20,7 +20,7 @@ typedef struct CacheNode {
     
     struct CacheNode* prev;
     struct CacheNode* next;
-    struct CacheNode* hash_next; 
+    struct CacheNode* hash_next;  // for handling collision(s) --> chaining
 } CacheNode;
 
 typedef struct {

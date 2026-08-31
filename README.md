@@ -270,55 +270,22 @@ To ensure production-grade stability, I developed a suite of automated stress te
 ***
 
 
-### 7. Automated Hardware Profiling & Power State Variance
+### 7. Benchmark Methodology
 
-To ensure our benchmarking methodology is completely standardized and reproducible, we built an automated profiling tool (`tests/benchmark_matrix.sh`). 
-
-**The Profiling Matrix:**
-This script automatically cycles the database through a matrix of hardware states (Plugged-In vs. Battery) and OS CPU Governors (Performance, Balanced, Power Saver). For each state, it wipes the data directory, boots the server, blasts 1M and 10M rows, kills the server, and logs the output. Finally, an embedded `awk` scraper parses the raw logs and automatically generates a formatted Markdown table of our throughput metrics.
-
-**The "Why" Behind Power State Variance:**
-During profiling, we observed a massive 2x performance drop when running the benchmarks on battery power versus wall power. This is caused by the operating system's Advanced Configuration and Power Interface (ACPI) policies. 
-* On battery power, the Linux kernel aggressively switches the CPU governor from `performance` to `powersave`. 
-* This disables CPU Turbo Boost, heavily downclocks core frequencies, and throttles hard-drive I/O to conserve wattage. 
-* Because FlexQL processes data at such high velocity, it immediately bottlenecks against these artificial OS limits. For maximum throughput, the host machine must be on wall power with the `performance` governor explicitly enabled.
-
-**📥 Raw Data Export:** [Download FINAL_BENCHMARKS.csv](benchmark_logs/FINAL_BENCHMARKS.csv)
+We use an automated profiling tool (`tests/benchmark_matrix.sh`) that wipes the data directory, boots the server, blasts 1M and 10M rows, kills the server, and logs the output. The figures below are measured on wall power with the OS `balanced` power profile (`power-profiles-daemon`, EPP `balance_performance`).
 
 
 ### Benchmark Results
 
-#### On battery:
+#### Plugged in, Balanced power profile:
 ##### Stats for 1M records:
-* Performance mode: **1086 ms** (920810 rows/sec)
-* Balanced mode: **2074 ms** (482160 rows/sec)
-* Power Saver mode: **1739 ms** (575043 rows/sec)
+* **1212 ms** (825,082 rows/sec)
 
 ##### Stats for 10M records:
-* Performance mode: **9352 ms** (1069289 rows/sec)
-* Balanced mode: **19177 ms** (521457 rows/sec)
-* Power Saver mode: **21705 ms** (460723 rows/sec)
+* **11264 ms** (887,784 rows/sec)
 
 ##### Average Throughput (1M & 10M combined):
-* Performance: **995049 rows/sec**
-* Balanced: **501808 rows/sec**
-* Power Saver: **517883 rows/sec**
-
-#### Plugged in:
-##### Stats for 1M records:
-* Performance mode: **897 ms** (1114827 rows/sec)
-* Balanced mode: **1105 ms** (904977 rows/sec)
-* Power Saver mode: **1736 ms** (576036 rows/sec)
-
-##### Stats for 10M records:
-* Performance mode: **8847 ms** (1130326 rows/sec)
-* Balanced mode: **12768 ms** (783208 rows/sec)
-* Power Saver mode: **21053 ms** (474991 rows/sec)
-
-##### Average Throughput (1M & 10M combined):
-* Performance: **1122576 rows/sec**
-* Balanced: **844092 rows/sec**
-* Power Saver: **525513 rows/sec**
+* **856,433 rows/sec**
 
 
 ***

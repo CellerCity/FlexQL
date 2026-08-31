@@ -80,9 +80,6 @@ void lru_evict(Pager* pager) {
         exit(EXIT_FAILURE); 
     }
 
-    // ... (The rest of the eviction logic remains exactly the same: flush if dirty, remove from DLL/Hash Map, and free memory) ...
-
-
     // Flush to disk ONLY if modified
     if (evict_node->is_dirty) {
         pager_flush(pager, evict_node);
@@ -234,8 +231,7 @@ void pager_close(Pager* pager) {
     CacheNode* curr = pager->head;
     while (curr != NULL) {
         pthread_rwlock_destroy(&curr->page_lock);
-        
-        // ... (free logic) ...
+
         CacheNode* next = curr->next;
         if (curr->is_dirty) {
             pager_flush(pager, curr);

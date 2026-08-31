@@ -134,6 +134,15 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
                     }
                     col_token = strtok_r(NULL, ",", &saveptr_comma);
                 }
+
+                // The loop above stops silently once column_count hits
+                // MAX_COLUMNS. If there was more column list left when it
+                // stopped, say so instead of quietly creating a truncated
+                // table the caller never asked for.
+                if (col_token != NULL && query->is_valid) {
+                    snprintf(query->error_msg, sizeof(query->error_msg), "Syntax error: CREATE TABLE supports at most %d columns.", MAX_COLUMNS);
+                    query->is_valid = 0;
+                }
             } else {
                 strcpy(query->error_msg, "Syntax error: Missing parentheses.");
             }

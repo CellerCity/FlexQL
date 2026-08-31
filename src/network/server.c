@@ -102,7 +102,7 @@ void* client_handler(void* socket_desc) {
     send(client_sock, welcome, strlen(welcome), 0);
 
     // --- THE BUFFER OVERFLOW FIX ---
-    // Use the heap (malloc) so we can hold the TA's massive 250KB string without crashing!
+    // Use the heap (malloc) so we can hold the massive 250KB string without crashing!
     size_t MAX_BUFFER = 10 * 1024 * 1024; // 10 Megabytes
     char* stream_buffer = malloc(MAX_BUFFER);
     stream_buffer[0] = '\0';
@@ -235,6 +235,9 @@ int main() {
     // Prevent dummy socket (fd = -1) from crashing the server during recovery
     signal(SIGPIPE, SIG_IGN);
 
+    // Crash Prevention: It ignores SIGPIPE. If a client disconnects unexpectedly while the server is trying to send data, a SIGPIPE is normally thrown, crashing the whole program. Ignoring it allows the send() function to just return an error instead.
+
+
     // Intercept CTRL+C for graceful Checkpointing!
     signal(SIGINT, handle_sigint);
 
@@ -257,6 +260,7 @@ int main() {
     // Allow port reuse to prevent "Address already in use" errors during testing
     int opt = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // SO_REUSEADDR is used to prevent annoying "Port in use" errors if you restart the server quickly.
 
     // 2. Configure the server address structure
     server_addr.sin_family = AF_INET;
@@ -287,7 +291,7 @@ int main() {
             continue;
         }
 
-        // --- THE FIX: Disable Nagle's Algorithm for the server responses ---
+        // --- THE FIX: Disable Nagle's Algorithm for the server responses, for low-latency communication---
         int flag = 1;
         setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
         // -------------------------------------------------------------------
@@ -296,7 +300,7 @@ int main() {
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
         // Allocate memory for the client socket to pass to the thread safely
-        // This prevents race conditions where the main thread overwrites client_socket
+        // This prevents a notorious race condition where the main loop overwrites the socket ID before the worker thread can read it.
         int *new_sock = malloc(sizeof(int));
         *new_sock = client_socket;
 
@@ -311,6 +315,7 @@ int main() {
 
         // Detach the thread so its resources are automatically freed upon completion
         pthread_detach(thread_id);
+        // The pthread_detach() function marks the thread identified by thread as detached.  When a detached thread terminates, its resources are automatically released back to the system without the need for another thread to join with the terminated thread.
     }
 
     close(server_socket);

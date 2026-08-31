@@ -6,7 +6,7 @@
 #define MAX_TABLE_NAME_LEN 64
 #define MAX_COLUMN_NAME_LEN 64
 #define MAX_TYPE_LEN 32
-#define MAX_COLUMNS 20         
+#define MAX_COLUMNS 100         
 #define MAX_VALUES 20          
 #define MAX_VALUE_LEN 128      
 #define MAX_ERROR_MSG_LEN 256
@@ -22,8 +22,8 @@ typedef enum {
     CMD_INSERT,          
     CMD_SELECT,
     CMD_DELETE,
-    CMD_SHOW_DB,         // NEW: SHOW DATABASES;
-    CMD_SHOW_TABLES      // NEW: SHOW TABLES;
+    CMD_SHOW_DB,
+    CMD_SHOW_TABLES
 } CommandType;
 
 // --- Supporting Structures ---
@@ -67,7 +67,7 @@ typedef struct {
 
     char order_by_column[64];
     int has_order_by;
-    int order_by_desc; // NEW: 0 for ASC, 1 for DESC
+    int order_by_desc; // 0 for ASC, 1 for DESC
 } ParsedQuery;
 
 // --- Function Prototypes ---

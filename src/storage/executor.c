@@ -29,10 +29,16 @@ static TableLock table_locks[100];
 static int num_table_locks = 0;
 static pthread_mutex_t lock_manager_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Dynamically gets or creates a Read-Write lock for a specific table
+// Dynamically gets or creates a Read-Write lock for a specific table.
+// Returns NULL if table_name doesn't fit the lock slot or the table
+// count exceeds table_locks' fixed capacity — callers must check.
 pthread_rwlock_t* get_table_lock(const char* table_name) {
+    if (strlen(table_name) >= sizeof(table_locks[0].table_name)) {
+        return NULL;
+    }
+
     pthread_mutex_lock(&lock_manager_mutex);
-    
+
     // Check if lock already exists
     for(int i = 0; i < num_table_locks; i++) {
         if(strcasecmp(table_locks[i].table_name, table_name) == 0) {
@@ -40,13 +46,18 @@ pthread_rwlock_t* get_table_lock(const char* table_name) {
             return &table_locks[i].rwlock;
         }
     }
-    
+
+    if (num_table_locks >= (int)(sizeof(table_locks) / sizeof(table_locks[0]))) {
+        pthread_mutex_unlock(&lock_manager_mutex);
+        return NULL;
+    }
+
     // Create new lock for this table
     strcpy(table_locks[num_table_locks].table_name, table_name);
     pthread_rwlock_init(&table_locks[num_table_locks].rwlock, NULL);
     pthread_rwlock_t* new_lock = &table_locks[num_table_locks].rwlock;
     num_table_locks++;
-    
+
     pthread_mutex_unlock(&lock_manager_mutex);
     return new_lock;
 }
@@ -404,6 +415,11 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
     
     // Grab EXCLUSIVE Write Lock!
     pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
+    if (t_lock == NULL) {
+        const char* err = "ERROR|Table name too long or too many distinct tables locked this session.\n";
+        send(client_sock, err, strlen(err), 0);
+        return -1;
+    }
     pthread_rwlock_wrlock(t_lock);
 
     while (*ptr != '\0') {
@@ -600,25 +616,112 @@ int evaluate_condition(int type, char* record_ptr, const char* op, const char* v
     return 0;
 }
 
+// Releases the two join-side locks acquired by execute_select. b is NULL
+// for a self-join (only a was ever locked), so it must be skipped rather
+// than unlocked a second time.
+void unlock_join_locks(pthread_rwlock_t* a, pthread_rwlock_t* b) {
+    if (b != NULL) pthread_rwlock_unlock(b);
+    if (a != NULL) pthread_rwlock_unlock(a);
+}
+
+// True if a SELECT list entry (optionally "table.column") refers to
+// column_name on the table named side_table. An unqualified entry matches
+// by name alone; the caller is responsible for treating that as ambiguous
+// if it also matches the other side.
+int join_col_matches_side(const char* select_entry, const char* side_table, const char* column_name) {
+    const char* dot = strchr(select_entry, '.');
+    if (dot != NULL) {
+        size_t qualifier_len = dot - select_entry;
+        if (strlen(side_table) != qualifier_len || strncasecmp(select_entry, side_table, qualifier_len) != 0) {
+            return 0;
+        }
+        return strcasecmp(dot + 1, column_name) == 0;
+    }
+    return strcasecmp(select_entry, column_name) == 0;
+}
+
+// Serializes one table's columns into a join output row, skipping columns
+// selected[i] marks as unselected. Skipped columns are still walked over
+// in the record so later columns keep decoding at the right offset.
+char* emit_join_columns(char* net_ptr, const char* rec, ColumnDef* schema, int ncols, const int* selected) {
+    uint16_t off = sizeof(TupleHeader);
+    for (int i = 0; i < ncols; i++) {
+        if (selected[i]) {
+            *net_ptr++ = '|';
+            int n_len = strlen(schema[i].name);
+            memcpy(net_ptr, schema[i].name, n_len); net_ptr += n_len;
+            *net_ptr++ = '|';
+        }
+        if (strcasecmp(schema[i].type, "INT") == 0) {
+            int32_t v; memcpy(&v, rec + off, 4);
+            if (selected[i]) net_ptr += sprintf(net_ptr, "%d", v);
+            off += 4;
+        } else if (strcasecmp(schema[i].type, "DECIMAL") == 0) {
+            double v; memcpy(&v, rec + off, 8);
+            if (selected[i]) net_ptr += sprintf(net_ptr, "%g", v);
+            off += 8;
+        } else if (strcasecmp(schema[i].type, "DATETIME") == 0) {
+            int64_t v; memcpy(&v, rec + off, 8);
+            if (selected[i]) {
+                time_t t = (time_t)v;
+                struct tm *tm_info = localtime(&t);
+                char time_str[32];
+                strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info);
+                net_ptr += sprintf(net_ptr, "%s", time_str);
+            }
+            off += 8;
+        } else {
+            uint16_t l; memcpy(&l, rec + off, 2);
+            if (selected[i]) { memcpy(net_ptr, rec + off + 2, l); net_ptr += l; }
+            off += 2 + l;
+        }
+    }
+    return net_ptr;
+}
+
 void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id, ParsedQuery* query, int client_sock) {
     char net_buffer[65536];  net_buffer[0] = '\0';
     if (strlen(current_db) == 0) {
         send(client_sock, "ERROR|No database selected.\n", 28, 0); return;
     }
 
-    // Grab SHARED Read Lock!
-    pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
-    pthread_rwlock_rdlock(t_lock);
+    // Grab locks in a canonical order (by table name) rather than query
+    // order, so a mirrored "A JOIN B" / "B JOIN A" pair can never form an
+    // ABBA deadlock against each other. A self-join acquires only once,
+    // since a second rdlock on the same table can deadlock against a
+    // writer queued in between the two calls.
+    pthread_rwlock_t* t_lock = NULL;
+    pthread_rwlock_t* t_lock_B = NULL;
 
-    
+    if (query->has_join && strcasecmp(query->table_name, query->join_table) != 0) {
+        pthread_rwlock_t* lock_left = get_table_lock(query->table_name);
+        pthread_rwlock_t* lock_right = get_table_lock(query->join_table);
+        if (lock_left == NULL || lock_right == NULL) {
+            send(client_sock, "ERROR|Table name too long or too many distinct tables locked this session.\n", 78, 0);
+            return;
+        }
+        if (strcasecmp(query->table_name, query->join_table) < 0) {
+            pthread_rwlock_rdlock(lock_left);
+            pthread_rwlock_rdlock(lock_right);
+        } else {
+            pthread_rwlock_rdlock(lock_right);
+            pthread_rwlock_rdlock(lock_left);
+        }
+        t_lock = lock_left;
+        t_lock_B = lock_right;
+    } else {
+        t_lock = get_table_lock(query->table_name);
+        if (t_lock == NULL) {
+            send(client_sock, "ERROR|Table name too long or too many distinct tables locked this session.\n", 78, 0);
+            return;
+        }
+        pthread_rwlock_rdlock(t_lock);
+    }
+
     // =========================================================
     // THE ULTIMATE INNER JOIN ENGINE (With WHERE & Fallbacks)
     // =========================================================
     if (query->has_join) {
-
-        // Grab a lock for Table B too!
-        pthread_rwlock_t* t_lock_B = get_table_lock(query->join_table);
-        pthread_rwlock_rdlock(t_lock_B);
 
         char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
 
@@ -626,13 +729,13 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         ColumnDef schema_A[100]; int cols_A = load_schema(db_path, query->table_name, schema_A);
         if (cols_A == -1) { 
             send(client_sock, "ERROR|Left table missing.\n", 26, 0); 
-            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+            unlock_join_locks(t_lock, t_lock_B); return;
         }
 
         ColumnDef schema_B[100]; int cols_B = load_schema(db_path, query->join_table, schema_B);
         if (cols_B == -1) { 
             send(client_sock, "ERROR|Right table missing.\n", 27, 0); 
-            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+            unlock_join_locks(t_lock, t_lock_B); return;
         }
 
         // 2. Identify Join Columns
@@ -645,7 +748,7 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
 
         if (join_idx_A == -1 || join_idx_B == -1) { 
             send(client_sock, "ERROR|Join columns not found.\n", 30, 0); 
-            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+            unlock_join_locks(t_lock, t_lock_B); return;
         }
         
         int type_join = 4;
@@ -689,12 +792,48 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             }
         }
 
+        // =========================================================
+        // RESOLVE THE SELECT LIST AGAINST BOTH SCHEMAS
+        // A table-qualified entry (e.g. "students.id") is matched only to
+        // the schema it names. An unqualified entry matches by name; if
+        // that name exists on both sides, it's ambiguous and we error out
+        // instead of guessing.
+        // =========================================================
+        int selected_A[100] = {0}, selected_B[100] = {0};
+        int cols_to_send = 0;
+
+        if (query->select_column_count == 0) {
+            for (int i = 0; i < cols_A; i++) { selected_A[i] = 1; cols_to_send++; }
+            for (int i = 0; i < cols_B; i++) { selected_B[i] = 1; cols_to_send++; }
+        } else {
+            for (int j = 0; j < query->select_column_count; j++) {
+                const char* entry = query->select_columns[j];
+                int is_qualified = strchr(entry, '.') != NULL;
+                int match_A = -1, match_B = -1;
+                for (int i = 0; i < cols_A; i++) if (join_col_matches_side(entry, query->table_name, schema_A[i].name)) { match_A = i; break; }
+                for (int i = 0; i < cols_B; i++) if (join_col_matches_side(entry, query->join_table, schema_B[i].name)) { match_B = i; break; }
+
+                if (!is_qualified && match_A != -1 && match_B != -1) {
+                    char err[160]; snprintf(err, sizeof(err), "ERROR|Column '%s' is ambiguous between %s and %s; qualify it.\n", entry, query->table_name, query->join_table);
+                    send(client_sock, err, strlen(err), 0);
+                    unlock_join_locks(t_lock, t_lock_B); return;
+                }
+                if (match_A == -1 && match_B == -1) {
+                    char err[128]; snprintf(err, sizeof(err), "ERROR|Column '%s' does not exist.\n", entry);
+                    send(client_sock, err, strlen(err), 0);
+                    unlock_join_locks(t_lock, t_lock_B); return;
+                }
+                if (match_A != -1 && !selected_A[match_A]) { selected_A[match_A] = 1; cols_to_send++; }
+                if (match_B != -1 && !selected_B[match_B]) { selected_B[match_B] = 1; cols_to_send++; }
+            }
+        }
+
         // Open Table B's Pager
         char path_B[1024]; snprintf(path_B, sizeof(path_B), "%s/%s.dat", db_path, query->join_table);
         Pager* pager_B = pager_open(path_B);
         if (!pager_B) { 
             send(client_sock, "ERROR|Failed to open right table.\n", 34, 0); 
-            pthread_rwlock_unlock(t_lock_B); pthread_rwlock_unlock(t_lock); return; 
+            unlock_join_locks(t_lock, t_lock_B); return;
         }
 
         char* net_ptr = net_buffer; int rows_sent = 0;
@@ -756,23 +895,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                                 }
 
                                 if (passes_where) {
-                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
-                                    uint16_t out_A = sizeof(TupleHeader);
-                                    for (int i = 0; i < cols_A; i++) {
-                                        *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                        if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
-                                        else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
-                                        else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
-                                        else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
-                                    }
-                                    uint16_t out_B = sizeof(TupleHeader);
-                                    for (int i = 0; i < cols_B; i++) {
-                                        *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                        if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
-                                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
-                                        else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
-                                        else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
-                                    }
+                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_to_send);
+                                    net_ptr = emit_join_columns(net_ptr, rec_A, schema_A, cols_A, selected_A);
+                                    net_ptr = emit_join_columns(net_ptr, rec_B, schema_B, cols_B, selected_B);
                                     *net_ptr++ = '\n'; rows_sent++;
                                     if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
                                 }
@@ -841,23 +966,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                                 }
 
                                 if (passes_where) {
-                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
-                                    uint16_t out_A = sizeof(TupleHeader);
-                                    for (int i = 0; i < cols_A; i++) {
-                                        *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                        if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
-                                        else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
-                                        else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
-                                        else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
-                                    }
-                                    uint16_t out_B = sizeof(TupleHeader);
-                                    for (int i = 0; i < cols_B; i++) {
-                                        *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                        if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
-                                        else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
-                                        else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
-                                        else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
-                                    }
+                                    net_ptr += sprintf(net_ptr, "ROW|%d", cols_to_send);
+                                    net_ptr = emit_join_columns(net_ptr, rec_A, schema_A, cols_A, selected_A);
+                                    net_ptr = emit_join_columns(net_ptr, rec_B, schema_B, cols_B, selected_B);
                                     *net_ptr++ = '\n'; rows_sent++;
                                     if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
                                 }
@@ -937,23 +1048,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
                                         }
 
                                         if (passes_where) {
-                                            net_ptr += sprintf(net_ptr, "ROW|%d", cols_A + cols_B);
-                                            uint16_t out_A = sizeof(TupleHeader);
-                                            for (int i = 0; i < cols_A; i++) {
-                                                *net_ptr++ = '|'; int n_len = strlen(schema_A[i].name); memcpy(net_ptr, schema_A[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                                if (strcasecmp(schema_A[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_A + out_A, 4); net_ptr += sprintf(net_ptr, "%d", v); out_A += 4; }
-                                                else if (strcasecmp(schema_A[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_A + out_A, 8); net_ptr += sprintf(net_ptr, "%g", v); out_A += 8; }
-                                                else if (strcasecmp(schema_A[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_A + out_A, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_A += 8; }
-                                                else { uint16_t l; memcpy(&l, rec_A + out_A, 2); memcpy(net_ptr, rec_A + out_A + 2, l); net_ptr += l; out_A += 2 + l; }
-                                            }
-                                            uint16_t out_B = sizeof(TupleHeader);
-                                            for (int i = 0; i < cols_B; i++) {
-                                                *net_ptr++ = '|'; int n_len = strlen(schema_B[i].name); memcpy(net_ptr, schema_B[i].name, n_len); net_ptr += n_len; *net_ptr++ = '|';
-                                                if (strcasecmp(schema_B[i].type, "INT") == 0) { int32_t v; memcpy(&v, rec_B + out_B, 4); net_ptr += sprintf(net_ptr, "%d", v); out_B += 4; }
-                                                else if (strcasecmp(schema_B[i].type, "DECIMAL") == 0) { double v; memcpy(&v, rec_B + out_B, 8); net_ptr += sprintf(net_ptr, "%g", v); out_B += 8; }
-                                                else if (strcasecmp(schema_B[i].type, "DATETIME") == 0) { int64_t v; memcpy(&v, rec_B + out_B, 8); time_t t = (time_t)v; struct tm *tm_info = localtime(&t); char time_str[32]; strftime(time_str, 32, "%Y-%m-%d %H:%M:%S", tm_info); net_ptr += sprintf(net_ptr, "%s", time_str); out_B += 8; }
-                                                else { uint16_t l; memcpy(&l, rec_B + out_B, 2); memcpy(net_ptr, rec_B + out_B + 2, l); net_ptr += l; out_B += 2 + l; }
-                                            }
+                                            net_ptr += sprintf(net_ptr, "ROW|%d", cols_to_send);
+                                            net_ptr = emit_join_columns(net_ptr, rec_A, schema_A, cols_A, selected_A);
+                                            net_ptr = emit_join_columns(net_ptr, rec_B, schema_B, cols_B, selected_B);
                                             *net_ptr++ = '\n'; rows_sent++;
                                             if ((net_ptr - net_buffer) >= 60000) { send(client_sock, net_buffer, net_ptr - net_buffer, 0); net_ptr = net_buffer; }
                                         }
@@ -975,8 +1072,7 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         
         pager_close(pager_B);
 
-        pthread_rwlock_unlock(t_lock_B); // Release Table B!
-        pthread_rwlock_unlock(t_lock);   // Release Table A!
+        unlock_join_locks(t_lock, t_lock_B); // Release both (or the one, for a self-join)
         return;
     }
 
