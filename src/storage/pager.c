@@ -16,8 +16,13 @@ uint32_t hash_page(uint32_t page_num) {
 Pager* pager_open(const char* filename) {
     int fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd == -1) {
+        // This used to exit(EXIT_FAILURE) here, which took the whole server
+        // down - every connected client - over one bad request (e.g. a table
+        // name long enough that DATA_DIR/db/name.dat exceeds the filesystem's
+        // NAME_MAX). Fail this one call instead; the caller reports an error
+        // to just its own client.
         perror("[-] Unable to open database file");
-        exit(EXIT_FAILURE);
+        return NULL;
     }
 
     

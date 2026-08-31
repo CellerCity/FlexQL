@@ -122,12 +122,26 @@ int execute_drop_db(ParsedQuery* query, char* current_db_session) {
 int execute_drop_table(const char* current_db, ParsedQuery* query) {
     if (strlen(current_db) == 0) return -1;
     char filepath[512];
-    
+
+    // Grab EXCLUSIVE lock so a concurrent reader/writer can't be mid-scan
+    // or mid-insert on the file while we unlink it out from under them.
+    pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
+    if (t_lock == NULL) return -1;
+    pthread_rwlock_wrlock(t_lock);
+
     snprintf(filepath, sizeof(filepath), "%s/%s/%s.schema", DATA_DIR, current_db, query->table_name);
-    if (remove(filepath) != 0) return -1; // If schema isn't there, table doesn't exist!
-    
+    if (remove(filepath) != 0) {
+        pthread_rwlock_unlock(t_lock);
+        return -1; // If schema isn't there, table doesn't exist!
+    }
+
     snprintf(filepath, sizeof(filepath), "%s/%s/%s.dat", DATA_DIR, current_db, query->table_name);
     remove(filepath);
+
+    char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
+    delete_root_page(db_path, query->table_name);
+
+    pthread_rwlock_unlock(t_lock);
     return 0;
 }
 
@@ -342,6 +356,7 @@ int execute_create(const char* current_db, ParsedQuery* query) {
 
     if (save_schema(path, query->table_name, query->columns, query->column_count) == 0) {
         Pager* pager = pager_open(filepath);
+        if (pager == NULL) return -1;
         Page* root_page = get_page(pager, 0);
         root_page->header.page_type = 1;
         BTreeNode* root_node = (BTreeNode*)root_page->data;
@@ -357,18 +372,34 @@ int execute_delete(const char* current_db, ParsedQuery* query) {
     if (strlen(current_db) == 0) return -1;
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s/%s/%s.dat", DATA_DIR, current_db, query->table_name);
-    
+
+    // Grab EXCLUSIVE lock — same reason as execute_drop_table: this unlinks
+    // and recreates the .dat file, which must not race a reader's scan or
+    // another writer's insert.
+    pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
+    if (t_lock == NULL) return -1;
+    pthread_rwlock_wrlock(t_lock);
+
     struct stat st = {0};
-    if (stat(filepath, &st) == -1) return -1; // File missing!
+    if (stat(filepath, &st) == -1) {
+        pthread_rwlock_unlock(t_lock);
+        return -1; // File missing!
+    }
 
     remove(filepath);
     Pager* pager = pager_open(filepath);
+    if (pager == NULL) { pthread_rwlock_unlock(t_lock); return -1; }
     Page* root_page = get_page(pager, 0);
     root_page->header.page_type = 1;
     BTreeNode* root_node = (BTreeNode*)root_page->data;
     root_node->is_leaf = 1; root_node->is_root = 1; root_node->num_keys = 0;
     unpin_page(pager, 0, 1);
     pager_close(pager);
+
+    char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
+    delete_root_page(db_path, query->table_name); // Fresh table, root is page 0 again.
+
+    pthread_rwlock_unlock(t_lock);
     return 0;
 }
 
@@ -842,7 +873,9 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         // ROUTE 1A: Table B has the Primary Key! (Outer: A, Inner: B)
         // =========================================================
         if (pk_idx_B != -1 && join_idx_B == pk_idx_B) {
-            uint32_t root_id_B = 0; 
+            // Table B's tree may have split in a session other than this one -
+            // page 0 is only the root until the first split moves it.
+            uint32_t root_id_B = load_root_page(db_path, query->join_table);
             for (uint32_t pid_A = 1; pid_A < pager->num_pages; pid_A++) {
                 Page* page_A = get_page(pager, pid_A);
                 if (page_A->header.page_type == 0) {

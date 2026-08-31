@@ -43,3 +43,32 @@ int load_schema(const char* current_db, const char* table_name, ColumnDef* colum
     fclose(file);
     return num_columns;
 }
+
+void save_root_page(const char* current_db, const char* table_name, uint32_t root_page_id) {
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/%s.root", current_db, table_name);
+
+    FILE* file = fopen(filename, "wb");
+    if (file == NULL) return;
+    fwrite(&root_page_id, sizeof(uint32_t), 1, file);
+    fclose(file);
+}
+
+uint32_t load_root_page(const char* current_db, const char* table_name) {
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/%s.root", current_db, table_name);
+
+    FILE* file = fopen(filename, "rb");
+    if (file == NULL) return 0; // No splits yet (or a freshly created table) - root is still page 0.
+
+    uint32_t root_page_id = 0;
+    if (fread(&root_page_id, sizeof(uint32_t), 1, file) != 1) root_page_id = 0;
+    fclose(file);
+    return root_page_id;
+}
+
+void delete_root_page(const char* current_db, const char* table_name) {
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/%s.root", current_db, table_name);
+    remove(filename);
+}

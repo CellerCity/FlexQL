@@ -15,6 +15,21 @@ void trim_string(char *str) {
     memmove(str, start, strlen(start) + 1);
 }
 
+// Bounds-checked copy for user-supplied identifiers/literals. Every one of
+// these fields is a fixed-size array (table_name[64], where_value[128], ...)
+// and used to be filled with a plain strcpy straight from the raw SQL token -
+// a 300-character table name overflowed the struct instead of getting
+// rejected. Marks the query invalid with a clear message instead.
+static int safe_copy(char* dest, size_t dest_size, const char* src, ParsedQuery* query, const char* field_label) {
+    if (strlen(src) >= dest_size) {
+        snprintf(query->error_msg, sizeof(query->error_msg), "Syntax error: %s exceeds the %zu-character limit.", field_label, dest_size - 1);
+        query->is_valid = 0;
+        return 0;
+    }
+    strcpy(dest, src);
+    return 1;
+}
+
 // =========================================================
 // MODULAR PARSERS
 // =========================================================
@@ -22,9 +37,10 @@ void trim_string(char *str) {
 static void parse_use(char* saveptr, ParsedQuery* query) {
     char* token = strtok_r(NULL, " \t\n;", &saveptr);
     if (token) {
-        query->type = CMD_USE_DB;
-        strcpy(query->db_name, token);
-        query->is_valid = 1;
+        if (safe_copy(query->db_name, sizeof(query->db_name), token, query, "Database name")) {
+            query->type = CMD_USE_DB;
+            query->is_valid = 1;
+        }
     } else {
         strcpy(query->error_msg, "Syntax error: Expected database name after USE.");
     }
@@ -40,16 +56,17 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
     if (strcasecmp(token, "DATABASE") == 0) {
         token = strtok_r(NULL, " \t\n;", &saveptr);
         if (token) {
-            query->type = CMD_CREATE_DB;
-            strcpy(query->db_name, token);
-            query->is_valid = 1;
+            if (safe_copy(query->db_name, sizeof(query->db_name), token, query, "Database name")) {
+                query->type = CMD_CREATE_DB;
+                query->is_valid = 1;
+            }
         } else {
             strcpy(query->error_msg, "Syntax error: Expected database name.");
         }
-    } 
+    }
     else if (strcasecmp(token, "TABLE") == 0) {
         query->type = CMD_CREATE_TABLE;
-        
+
         token = strtok_r(NULL, " \t\n(", &saveptr);
         if (token && strcasecmp(token, "IF") == 0) {
             char* next1 = strtok_r(NULL, " \t\n", &saveptr);
@@ -63,56 +80,60 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
         }
 
         if (token) {
-            strcpy(query->table_name, token);
+            if (!safe_copy(query->table_name, sizeof(query->table_name), token, query, "Table name")) return;
             const char *start_paren = strchr(sql_string, '(');
             const char *end_paren = strrchr(sql_string, ')');
-            
+
             if (start_paren && end_paren && start_paren < end_paren) {
-                char cols_str[512];
+                // Sized to the actual column-list text instead of a fixed
+                // 512-byte buffer, which used to silently truncate any
+                // CREATE TABLE whose column list ran past 511 characters -
+                // independent of (and hit well before) the 100-column cap.
                 int len = end_paren - start_paren - 1;
-                if (len >= 512) len = 511; // Safety
-                strncpy(cols_str, start_paren + 1, len);
+                char* cols_str = malloc(len + 1);
+                memcpy(cols_str, start_paren + 1, len);
                 cols_str[len] = '\0';
-                
+
                 // DEFENSE: Check for empty parentheses CREATE TABLE empty ()
-                char check_empty[512];
-                strcpy(check_empty, cols_str);
+                char* check_empty = strdup(cols_str);
                 trim_string(check_empty);
                 if (strlen(check_empty) == 0) {
                     strcpy(query->error_msg, "Syntax error: Table must have at least one column.");
+                    free(check_empty); free(cols_str);
                     return;
                 }
-                
-                query->is_valid = 1; 
-                int pk_count = 0; 
+                free(check_empty);
+
+                query->is_valid = 1;
+                int pk_count = 0;
                 char *saveptr_comma;
                 char *col_token = strtok_r(cols_str, ",", &saveptr_comma);
-                
+
                 while (col_token && query->column_count < MAX_COLUMNS && query->is_valid) {
                     trim_string(col_token);
                     char col_copy[128];
                     strncpy(col_copy, col_token, sizeof(col_copy)-1);
                     col_copy[sizeof(col_copy)-1] = '\0';
-                    
+
                     char *saveptr_space;
                     char *word = strtok_r(col_copy, " \t", &saveptr_space);
                     if (word) {
-                        strcpy(query->columns[query->column_count].name, word); 
+                        if (!safe_copy(query->columns[query->column_count].name, sizeof(query->columns[query->column_count].name), word, query, "Column name")) break;
                         word = strtok_r(NULL, " \t", &saveptr_space);
-                        
+
                         if (word) {
                             if (strcasecmp(word, "INT") != 0 &&
                                 strcasecmp(word, "DECIMAL") != 0 &&
-                                strncasecmp(word, "VARCHAR", 7) != 0 && 
-                                strcasecmp(word, "TEXT") != 0 && 
+                                strncasecmp(word, "VARCHAR", 7) != 0 &&
+                                strcasecmp(word, "TEXT") != 0 &&
                                 strcasecmp(word, "DATETIME") != 0) {
                                 snprintf(query->error_msg, sizeof(query->error_msg), "Syntax error: Invalid type '%s'.", word);
                                 query->is_valid = 0; break;
                             }
-                            
+
                             if (strncasecmp(word, "VARCHAR", 7) == 0) strcpy(query->columns[query->column_count].type, "VARCHAR");
-                            else strcpy(query->columns[query->column_count].type, word); 
-                            
+                            else if (!safe_copy(query->columns[query->column_count].type, sizeof(query->columns[query->column_count].type), word, query, "Column type")) break;
+
                             while ((word = strtok_r(NULL, " \t", &saveptr_space)) != NULL) {
                                 if (strcasecmp(word, "PRIMARY") == 0) {
                                     query->columns[query->column_count].is_primary_key = 1;
@@ -121,7 +142,7 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
                                     query->columns[query->column_count].is_not_null = 1;
                                 }
                             }
-                            
+
                             if (pk_count > 1) {
                                 strcpy(query->error_msg, "Syntax error: Only one PRIMARY KEY allowed.");
                                 query->is_valid = 0; break;
@@ -143,6 +164,7 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
                     snprintf(query->error_msg, sizeof(query->error_msg), "Syntax error: CREATE TABLE supports at most %d columns.", MAX_COLUMNS);
                     query->is_valid = 0;
                 }
+                free(cols_str);
             } else {
                 strcpy(query->error_msg, "Syntax error: Missing parentheses.");
             }
@@ -163,18 +185,20 @@ static void parse_drop(char* saveptr, ParsedQuery* query) {
     if (strcasecmp(token, "TABLE") == 0) {
         token = strtok_r(NULL, " \t\n;", &saveptr);
         if (token) {
-            query->type = CMD_DROP_TABLE;
-            strcpy(query->table_name, token);
-            query->is_valid = 1;
+            if (safe_copy(query->table_name, sizeof(query->table_name), token, query, "Table name")) {
+                query->type = CMD_DROP_TABLE;
+                query->is_valid = 1;
+            }
         } else {
              strcpy(query->error_msg, "Syntax error: Expected table name.");
         }
     } else if (strcasecmp(token, "DATABASE") == 0) {
          token = strtok_r(NULL, " \t\n;", &saveptr);
          if (token) {
-             query->type = CMD_DROP_DB;
-             strcpy(query->db_name, token);
-             query->is_valid = 1;
+             if (safe_copy(query->db_name, sizeof(query->db_name), token, query, "Database name")) {
+                 query->type = CMD_DROP_DB;
+                 query->is_valid = 1;
+             }
          } else {
              strcpy(query->error_msg, "Syntax error: Expected database name.");
          }
@@ -185,13 +209,13 @@ static void parse_drop(char* saveptr, ParsedQuery* query) {
 
 static void parse_insert(char* saveptr, const char* sql_string, ParsedQuery* query) {
     query->type = CMD_INSERT;
-    char* token = strtok_r(NULL, " \t\n", &saveptr); 
-    
+    char* token = strtok_r(NULL, " \t\n", &saveptr);
+
     if (token && strcasecmp(token, "INTO") == 0) {
-        token = strtok_r(NULL, " \t\n(", &saveptr); 
+        token = strtok_r(NULL, " \t\n(", &saveptr);
         if (token) {
-            strcpy(query->table_name, token);
-            token = strtok_r(NULL, " \t\n(", &saveptr); 
+            if (!safe_copy(query->table_name, sizeof(query->table_name), token, query, "Table name")) return;
+            token = strtok_r(NULL, " \t\n(", &saveptr);
             if (token && strcasecmp(token, "VALUES") == 0) {
 
                 const char *start_paren = strchr(sql_string, '(');
@@ -199,10 +223,10 @@ static void parse_insert(char* saveptr, const char* sql_string, ParsedQuery* que
                     int open_count = 0, close_count = 0, in_string = 0;
                     int empty_check = 1; // DEFENSE: Check for empty parens
                     const char* scan_ptr = start_paren;
-                    
+
                     while (*scan_ptr != '\0' && *scan_ptr != ';') {
                         if (*scan_ptr == '\'' || *scan_ptr == '"') {
-                            in_string = !in_string; 
+                            in_string = !in_string;
                             empty_check = 0;
                         }
                         if (!in_string) {
@@ -214,7 +238,7 @@ static void parse_insert(char* saveptr, const char* sql_string, ParsedQuery* que
                         }
                         scan_ptr++;
                     }
-                    
+
                     if (open_count == 0 || open_count != close_count || in_string) {
                         strcpy(query->error_msg, "Syntax error: Malformed or incomplete tuple list.");
                     } else if (empty_check) {
@@ -243,9 +267,9 @@ static void parse_delete(char* saveptr, ParsedQuery* query) {
     if (token && strcasecmp(token, "FROM") == 0) {
         token = strtok_r(NULL, " \t\n;", &saveptr);
         if (token) {
-            strcpy(query->table_name, token);
+            if (!safe_copy(query->table_name, sizeof(query->table_name), token, query, "Table name")) return;
             query->is_valid = 1;
-            
+
             // --- THE SAFETY LOCK ---
             // If the user tries to use WHERE, we stop them immediately to prevent data loss!
             token = strtok_r(NULL, " \t\n;", &saveptr);
@@ -253,7 +277,7 @@ static void parse_delete(char* saveptr, ParsedQuery* query) {
                 strcpy(query->error_msg, "Syntax error: DELETE with WHERE is not supported. Use DELETE FROM table to truncate the entire table.");
                 query->is_valid = 0;
             }
-            
+
         } else {
             strcpy(query->error_msg, "Syntax error: Expected table name after FROM.");
         }
@@ -264,30 +288,30 @@ static void parse_delete(char* saveptr, ParsedQuery* query) {
 
 static void parse_select(char* saveptr, ParsedQuery* query) {
     query->type = CMD_SELECT;
-    query->is_valid = 1; 
-    int state = 1; 
+    query->is_valid = 1;
+    int state = 1;
 
     char* token;
     while ((token = strtok_r(NULL, " \t\n;", &saveptr)) != NULL) {
         if (strcasecmp(token, "FROM") == 0) {
             state = 2;
             token = strtok_r(NULL, " \t\n;", &saveptr);
-            if (token) strcpy(query->table_name, token);
+            if (token && !safe_copy(query->table_name, sizeof(query->table_name), token, query, "Table name")) return;
             continue;
         }
         if (strcasecmp(token, "INNER") == 0) {
             state = 3;
-            token = strtok_r(NULL, " \t\n;", &saveptr); 
+            token = strtok_r(NULL, " \t\n;", &saveptr);
             if (token && strcasecmp(token, "JOIN") == 0) {
                 query->has_join = 1;
-                token = strtok_r(NULL, " \t\n;", &saveptr); 
-                if (token) strcpy(query->join_table, token);
+                token = strtok_r(NULL, " \t\n;", &saveptr);
+                if (token && !safe_copy(query->join_table, sizeof(query->join_table), token, query, "Join table name")) return;
                 token = strtok_r(NULL, " \t\n;", &saveptr); // ON
                 token = strtok_r(NULL, " \t\n;", &saveptr); // L-Cond
-                if (token) strcpy(query->join_condition_left, token);
+                if (token && !safe_copy(query->join_condition_left, sizeof(query->join_condition_left), token, query, "Join condition")) return;
                 token = strtok_r(NULL, " \t\n;", &saveptr); // =
                 token = strtok_r(NULL, " \t\n;", &saveptr); // R-Cond
-                if (token) strcpy(query->join_condition_right, token);
+                if (token && !safe_copy(query->join_condition_right, sizeof(query->join_condition_right), token, query, "Join condition")) return;
             }
             continue;
         }
@@ -295,8 +319,8 @@ static void parse_select(char* saveptr, ParsedQuery* query) {
             state = 4;
             query->has_where = 1;
             token = strtok_r(NULL, " \t\n;", &saveptr);
-            if (token) strcpy(query->where_column, token);
-            
+            if (token && !safe_copy(query->where_column, sizeof(query->where_column), token, query, "WHERE column name")) return;
+
             token = strtok_r(NULL, " \t\n;", &saveptr);
             if (token) {
                 // DEFENSE: Strictly validate the operator
@@ -309,11 +333,11 @@ static void parse_select(char* saveptr, ParsedQuery* query) {
                     return;
                 }
             }
-            
+
             token = strtok_r(NULL, " \t\n;", &saveptr);
             if (token) {
-                trim_string(token); 
-                strcpy(query->where_value, token);
+                trim_string(token);
+                if (!safe_copy(query->where_value, sizeof(query->where_value), token, query, "WHERE value")) return;
             }
             continue;
         }
@@ -323,11 +347,11 @@ static void parse_select(char* saveptr, ParsedQuery* query) {
             if (token && strcasecmp(token, "BY") == 0) {
                 query->has_order_by = 1;
                 token = strtok_r(NULL, " \t\n;", &saveptr); // Col
-                if (token) strcpy(query->order_by_column, token);
+                if (token && !safe_copy(query->order_by_column, sizeof(query->order_by_column), token, query, "ORDER BY column name")) return;
             }
             continue;
         }
-        
+
         // ASC / DESC check
         if (state == 5) {
             if (strcasecmp(token, "DESC") == 0) query->order_by_desc = 1;
@@ -338,14 +362,14 @@ static void parse_select(char* saveptr, ParsedQuery* query) {
 
         if (state == 1) {
             if (token[strlen(token) - 1] == ',') token[strlen(token) - 1] = '\0';
-            if (strcmp(token, "*") == 0) query->select_column_count = 0; 
+            if (strcmp(token, "*") == 0) query->select_column_count = 0;
             else if (strlen(token) > 0) {
-                strcpy(query->select_columns[query->select_column_count], token);
+                if (!safe_copy(query->select_columns[query->select_column_count], sizeof(query->select_columns[0]), token, query, "Selected column name")) return;
                 query->select_column_count++;
             }
         }
     }
-    
+
     if (strlen(query->table_name) == 0) {
         strcpy(query->error_msg, "Syntax error: Missing FROM clause or table name.");
         query->is_valid = 0;
@@ -386,7 +410,7 @@ ParsedQuery parse_sql(const char* sql_string) {
     query.has_where = 0;
     query.has_order_by = 0;
     query.order_by_desc = 0; // Default ASC
-    
+
     query.table_name[0] = '\0';
     query.db_name[0] = '\0';
     query.error_msg[0] = '\0';
@@ -401,7 +425,7 @@ ParsedQuery parse_sql(const char* sql_string) {
 
     char* sql_copy = strdup(sql_string);
     char* saveptr;
-    
+
     char *token = strtok_r(sql_copy, " \t\n", &saveptr);
     if (!token) {
         strcpy(query.error_msg, "Empty query.");

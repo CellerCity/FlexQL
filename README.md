@@ -2,7 +2,7 @@
 
 **GitHub Repository:** https://github.com/CellerCity/FlexQL
 
-FlexQL is a custom-built, highly optimized relational database management system written entirely in C/C++. It features a multithreaded client-server architecture, supports standard SQL operations, bulk inserts, B+ Tree indexing, an LRU Buffer Pool, thread-safe concurrency, and fault-tolerant crash recovery.
+FlexQL is a custom-built relational database management system written entirely in C/C++, sustaining over 1M single-client inserts/sec at 10M-row scale. It features a multithreaded client-server architecture, supports standard SQL operations, bulk inserts, B+ Tree indexing, an LRU Buffer Pool, thread-safe concurrency, and crash recovery after a killed server process.
 
 ## 1. Compilation and Execution Instructions
 
@@ -242,7 +242,7 @@ Getting our database to process hundreds of thousands of rows per second require
 
 * **Network Overhead & TCP Batching:** Originally, sending a TCP packet for every single row caused massive network latency. I implemented TCP Batching. The client sends up to 5,000 rows in a single formatted string. The server parses the entire string in memory and commits it, drastically cutting insertion times.
 * **The 100-Column Limit (Memory Fragmentation):** Using `malloc` and `free` for every column of every row caused severe memory fragmentation. I enforced a deliberate **100-column hard limit** per table. This allowed us to use static stack arrays instead of dynamically allocating heap memory. This $O(1)$ memory allocation strategy ensures perfect data locality in the CPU cache.
-* **Fault Tolerance (Write-Ahead Logging):** To survive power outages, I implemented a Group-Commit WAL. Before touching the disk, I validate batches in RAM. If they pass, I log the string to `recovery.wal`. If the server crashes mid-batch, the next boot reads the WAL and uses **Idempotent Replay**—silently skipping rows already in the B-Tree and cleanly finishing the rest of the batch.
+* **Fault Tolerance (Write-Ahead Logging):** To survive a killed server process (e.g. `kill -9`), I implemented a Group-Commit WAL. Before touching the disk, I validate batches in RAM. If they pass, I log the string to `recovery.wal` and `fflush` it, which survives the process being killed but not a power loss or kernel panic (that would need an `fsync`, which we did not add). If the server is killed mid-batch, the next boot reads the WAL and uses **Idempotent Replay**—silently skipping rows already in the B-Tree and cleanly finishing the rest of the batch.
 
 ---
 
@@ -250,7 +250,7 @@ Getting our database to process hundreds of thousands of rows per second require
 I built an intelligent execution engine for `INNER JOIN` operations that dynamically analyzes schemas. 
 * If **Table A** has an index but **Table B** does not, the engine scans Table B sequentially and fires fast $O(\log N)$ binary searches into Table A's B+ Tree. 
 * It automatically flips the inner and outer loops based on which table is indexed to guarantee the fastest path. 
-* If neither is indexed, it gracefully falls back to a Block Nested Loop Join.
+* If neither is indexed, it falls back to a nested loop join.
 
 ---
 

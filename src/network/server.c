@@ -12,17 +12,21 @@
 #include "../parser/parser.h"
 #include "../storage/executor.h"
 #include "../storage/pager.h"
+#include "../storage/schema.h"
 
 #define PORT 9000
 
 
 // --- GRACEFUL SHUTDOWN HANDLER ---
+// printf/remove/exit are not async-signal-safe, so the handler only sets a
+// flag; the accept loop drains it and does the actual shutdown. We also no
+// longer delete recovery.wal here: any dirty pages still sitting in a client
+// thread's buffer pool die with the process just like under kill -9, so the
+// WAL must survive to replay them on the next boot. Treating Ctrl+C as "just
+// another crash" means it can never lose more than kill -9 does.
+volatile sig_atomic_t shutdown_requested = 0;
 void handle_sigint(int sig) {
-    printf("\n[*] Graceful shutdown initiated. Checkpointing data...\n");
-    // The database is safe, so we can securely delete the crash log!
-    remove("flexql_data/recovery.wal"); 
-    printf("[+] WAL cleared. Server safely terminated.\n");
-    exit(0);
+    shutdown_requested = 1;
 }
 
 // --- WAL GLOBALS ---
@@ -63,9 +67,14 @@ void replay_wal() {
                 if (active_pager != NULL) pager_close(active_pager);
                 char filepath[512]; snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
                 active_pager = pager_open(filepath);
+                if (active_pager == NULL) { active_table[0] = '\0'; continue; }
                 strcpy(active_table, q.table_name);
+                char db_path[512]; snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
+                active_root_page = load_root_page(db_path, q.table_name);
             }
             execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, dummy_sock);
+            char db_path[512]; snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
+            save_root_page(db_path, q.table_name, active_root_page);
         }
     }
 
@@ -185,20 +194,34 @@ void* client_handler(void* socket_desc) {
                 send_default_response = 0;
             } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
                 
+                char db_path[512];
+                snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
+
                 if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
-                    if (active_pager != NULL) pager_close(active_pager); 
+                    if (active_pager != NULL) pager_close(active_pager);
                     char filepath[512];
                     snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
                     active_pager = pager_open(filepath);
+                    if (active_pager == NULL) {
+                        active_table[0] = '\0';
+                        send(client_sock, "ERROR|Could not open table (name too long for the filesystem, or a disk error).\n", 82, 0);
+                        send_default_response = 0;
+                        goto next_query;
+                    }
                     strcpy(active_table, q.table_name);
+                    // The B+Tree root moves off page 0 the first time it splits, and that
+                    // move only lived in the PREVIOUS connection's memory. Reload the real
+                    // current root every time we (re)attach to a table.
+                    active_root_page = load_root_page(db_path, q.table_name);
                 }
-                
+
                 if (q.type == CMD_INSERT) {
                     int status = execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, client_sock);
-                    
+                    save_root_page(db_path, q.table_name, active_root_page);
+
                     if (status == -1) {
                         // The executor already sent the ERROR| string, so we prevent the server from sending DONE|
-                        send_default_response = 0; 
+                        send_default_response = 0;
                     }
                 } else if (q.type == CMD_SELECT) {
                     send_default_response = 0; 
@@ -208,6 +231,7 @@ void* client_handler(void* socket_desc) {
                 strcpy(response, "ERROR|Unrecognized command type.\n");
             }
 
+            next_query:
             if (send_default_response) {
                 send(client_sock, response, strlen(response), 0);
             }
@@ -287,6 +311,11 @@ int main() {
     while (1) {
         client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &addr_len);
         if (client_socket < 0) {
+            if (shutdown_requested) {
+                printf("\n[*] Graceful shutdown initiated. WAL left intact for recovery on next boot.\n");
+                close(server_socket);
+                exit(0);
+            }
             perror("[-] Accept failed");
             continue;
         }
