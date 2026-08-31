@@ -272,10 +272,20 @@ To ensure production-grade stability, I developed a suite of automated stress te
 
 ### 7. Benchmark Methodology
 
-We use an automated profiling tool (`tests/benchmark_matrix.sh`) that wipes the data directory, boots the server, blasts 1M and 10M rows, kills the server, and logs the output. The figures below are measured on wall power with the OS `balanced` power profile (`power-profiles-daemon`, EPP `balance_performance`).
+We use an automated profiling tool (`tests/benchmark_matrix.sh`) that wipes the data directory, boots the server, blasts 1M and 10M rows, kills the server, and logs the output. The figures below are measured on wall power, comparing the OS `performance` and `balanced` power profiles (`power-profiles-daemon`).
 
 
 ### Benchmark Results
+
+#### Plugged in, Performance power profile:
+##### Stats for 1M records:
+* **840 ms** (1,190,476 rows/sec)
+
+##### Stats for 10M records:
+* **8469 ms** (1,180,776 rows/sec)
+
+##### Average Throughput (1M & 10M combined):
+* **1,185,626 rows/sec**
 
 #### Plugged in, Balanced power profile:
 ##### Stats for 1M records:
