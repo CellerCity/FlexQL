@@ -279,23 +279,23 @@ We use an automated profiling tool (`tests/benchmark_matrix.sh`) that wipes the 
 
 #### Plugged in, Performance power profile:
 ##### Stats for 1M records:
-* **860 ms** (1,162,790 rows/sec)
+* **896 ms** (1,116,071 rows/sec)
 
 ##### Stats for 10M records:
-* **8419 ms** (1,187,789 rows/sec)
+* **8761 ms** (1,141,422 rows/sec)
 
 ##### Average Throughput (1M & 10M combined):
-* **1,175,290 rows/sec**
+* **1,128,747 rows/sec**
 
 #### Plugged in, Balanced power profile:
 ##### Stats for 1M records:
-* **1173 ms** (852,514 rows/sec)
+* **1233 ms** (811,030 rows/sec)
 
 ##### Stats for 10M records:
-* **11644 ms** (858,811 rows/sec)
+* **11844 ms** (844,309 rows/sec)
 
 ##### Average Throughput (1M & 10M combined):
-* **855,663 rows/sec**
+* **827,670 rows/sec**
 
 
 ***
