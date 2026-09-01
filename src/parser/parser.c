@@ -127,6 +127,16 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
                     char *saveptr_space;
                     char *word = strtok_r(col_copy, " \t", &saveptr_space);
                     if (word) {
+                        // is_primary_key/is_not_null are only ever set to 1
+                        // below, when found - never explicitly reset to 0 for
+                        // the (far more common) case where a column has
+                        // neither. query is a plain stack variable, so both
+                        // flags were reading uninitialised stack garbage
+                        // until now - valgrind flagged it, and a garbage
+                        // nonzero value here would get written to the
+                        // .schema file and read back as a real constraint.
+                        query->columns[query->column_count].is_primary_key = 0;
+                        query->columns[query->column_count].is_not_null = 0;
                         if (!safe_copy(query->columns[query->column_count].name, sizeof(query->columns[query->column_count].name), word, query, "Column name")) break;
                         word = strtok_r(NULL, " \t", &saveptr_space);
 

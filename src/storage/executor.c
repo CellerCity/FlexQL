@@ -447,9 +447,13 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
     if (cached_num_cols == -1) {
         const char* err = "ERROR|Table does not exist.\n";
         send(client_sock, err, strlen(err), 0);
+        // bulk_insert_ptr was already strdup'd by the parser before we ever
+        // got here - valgrind caught this as a genuine small leak (INSERT
+        // INTO a table that doesn't exist), one per rejected statement.
+        free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
         return -1;
     }
-    
+
     if (query->bulk_insert_ptr == NULL) return -1;
 
     char* ptr = query->bulk_insert_ptr;
@@ -540,7 +544,13 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
                 }
             }
 
-            IndexKey pk;
+            // IndexKey's value union is 32 bytes (str_val), but an INT or
+            // DECIMAL key only ever writes 4 or 8 of them below - the whole
+            // struct still gets copied into the B+Tree leaf's keys[] array
+            // and flushed to disk as-is, so the unused union bytes were
+            // raw stack garbage. valgrind flagged it; zero the struct once
+            // here instead of chasing it at every write site downstream.
+            IndexKey pk = {0};
             if (has_pk) {
                 // Extract Primary Key for validation
                 if (cached_types[pk_idx] == 1) {

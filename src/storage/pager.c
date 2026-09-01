@@ -232,7 +232,13 @@ Page* get_page(Pager* pager, uint32_t page_num) {
 
     CacheNode* new_node = malloc(sizeof(CacheNode));
     new_node->page_num = page_num;
-    new_node->page_data = malloc(sizeof(Page));
+    // calloc, not malloc: a brand-new page only gets its header fields set
+    // below (page_id, num_slots, free_space_ptr) - num_slots/num_keys = 0
+    // means nothing downstream ever reads the rest of the buffer, but the
+    // unused bytes still got written to disk as raw heap garbage on every
+    // flush. valgrind flagged this directly (uninitialised bytes passed to
+    // write()); zeroing it here is one line and removes the whole class.
+    new_node->page_data = calloc(1, sizeof(Page));
     new_node->is_dirty = 0;
     
     // Initialize concurrency state
