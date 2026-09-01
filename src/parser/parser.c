@@ -91,11 +91,20 @@ static void parse_create(char* saveptr, const char* sql_string, ParsedQuery* que
                 // independent of (and hit well before) the 100-column cap.
                 int len = end_paren - start_paren - 1;
                 char* cols_str = malloc(len + 1);
+                if (cols_str == NULL) {
+                    strcpy(query->error_msg, "Internal error: out of memory parsing column list.");
+                    return;
+                }
                 memcpy(cols_str, start_paren + 1, len);
                 cols_str[len] = '\0';
 
                 // DEFENSE: Check for empty parentheses CREATE TABLE empty ()
                 char* check_empty = strdup(cols_str);
+                if (check_empty == NULL) {
+                    strcpy(query->error_msg, "Internal error: out of memory parsing column list.");
+                    free(cols_str);
+                    return;
+                }
                 trim_string(check_empty);
                 if (strlen(check_empty) == 0) {
                     strcpy(query->error_msg, "Syntax error: Table must have at least one column.");

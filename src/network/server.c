@@ -64,21 +64,21 @@ void replay_wal() {
         else if (q.type == CMD_DROP_TABLE) execute_drop_table(current_db, &q);
         else if (q.type == CMD_INSERT) {
             if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
-                if (active_pager != NULL) pager_close(active_pager);
+                // Not pager_close(active_pager) here - the pager is shared
+                // across every connection/table-attach for its file path
+                // now, so detaching from it doesn't mean destroying it.
                 char filepath[512]; snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
                 active_pager = pager_open(filepath);
                 if (active_pager == NULL) { active_table[0] = '\0'; continue; }
                 strcpy(active_table, q.table_name);
-                char db_path[512]; snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
-                active_root_page = load_root_page(db_path, q.table_name);
             }
+            // execute_insert reloads/saves the real root itself, under its
+            // own write lock - active_root_page here is just a scratch
+            // value passed by reference.
             execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, dummy_sock);
-            char db_path[512]; snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
-            save_root_page(db_path, q.table_name, active_root_page);
         }
     }
 
-    if (active_pager != NULL) pager_close(active_pager);
     free(line);
     fclose(wal_file);
     is_recovery_mode = 0; // Turn off recovery mode!
@@ -181,7 +181,11 @@ void* client_handler(void* socket_desc) {
                     strcpy(response, "ERROR|Table does not exist.\n");
                 } else {
                     if (active_pager != NULL && strcmp(active_table, q.table_name) == 0) {
-                        pager_close(active_pager);
+                        // execute_delete() already retired and reopened the
+                        // shared pager for this table internally - this
+                        // connection's cached pointer is stale, not ours to
+                        // close. Just drop the cached reference so the next
+                        // query on this table re-fetches the current one.
                         active_pager = NULL;
                         active_table[0] = '\0';
                     }
@@ -193,12 +197,9 @@ void* client_handler(void* socket_desc) {
                 execute_show_tables(current_db, client_sock);
                 send_default_response = 0;
             } else if (q.type == CMD_INSERT || q.type == CMD_SELECT) {
-                
-                char db_path[512];
-                snprintf(db_path, sizeof(db_path), "flexql_data/%s", current_db);
 
                 if (active_pager == NULL || strcmp(active_table, q.table_name) != 0) {
-                    if (active_pager != NULL) pager_close(active_pager);
+                    // Not pager_close(active_pager) - see replay_wal() above.
                     char filepath[512];
                     snprintf(filepath, sizeof(filepath), "flexql_data/%s/%s.dat", current_db, q.table_name);
                     active_pager = pager_open(filepath);
@@ -209,15 +210,16 @@ void* client_handler(void* socket_desc) {
                         goto next_query;
                     }
                     strcpy(active_table, q.table_name);
-                    // The B+Tree root moves off page 0 the first time it splits, and that
-                    // move only lived in the PREVIOUS connection's memory. Reload the real
-                    // current root every time we (re)attach to a table.
-                    active_root_page = load_root_page(db_path, q.table_name);
                 }
+                // execute_insert/execute_select each reload the real root
+                // themselves, under their own lock, right before using it -
+                // active_root_page here is just a scratch value passed by
+                // reference/value. See executor.c for why: a value cached
+                // only on attach can go stale the moment another connection
+                // splits the tree in between.
 
                 if (q.type == CMD_INSERT) {
                     int status = execute_insert(current_db, active_pager, &active_root_page, &active_data_page, &q, client_sock);
-                    save_root_page(db_path, q.table_name, active_root_page);
 
                     if (status == -1) {
                         // The executor already sent the ERROR| string, so we prevent the server from sending DONE|
@@ -242,7 +244,8 @@ void* client_handler(void* socket_desc) {
     }
 
 graceful_shutdown:
-    if (active_pager != NULL) pager_close(active_pager); 
+    // Not pager_close(active_pager) - a disconnecting client doesn't own the
+    // shared pager for whatever table it last touched.
     
     // Clean up our massive heap allocations!
     free(stream_buffer);
@@ -263,7 +266,15 @@ int main() {
 
 
     // Intercept CTRL+C for graceful Checkpointing!
-    signal(SIGINT, handle_sigint);
+    // NOT signal() - glibc's signal() installs with SA_RESTART (BSD
+    // semantics) by default, which silently auto-restarts accept() after
+    // the handler returns. That means accept() never returns -1/EINTR, so
+    // the shutdown_requested flag set below would never actually be read
+    // and Ctrl+C would stop doing anything at all.
+    struct sigaction sa_int = {0};
+    sa_int.sa_handler = handle_sigint;
+    sa_int.sa_flags = 0; // deliberately NOT SA_RESTART
+    sigaction(SIGINT, &sa_int, NULL);
 
     // Auto-recover from WAL before opening network!
     mkdir("flexql_data", 0777); 

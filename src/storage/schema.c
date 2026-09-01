@@ -48,10 +48,23 @@ void save_root_page(const char* current_db, const char* table_name, uint32_t roo
     char filename[512];
     snprintf(filename, sizeof(filename), "%s/%s.root", current_db, table_name);
 
-    FILE* file = fopen(filename, "wb");
+    // Write to a temp file and rename() it over the target instead of
+    // fopen(..., "wb") on the real file directly. "wb" truncates to 0 bytes
+    // the instant it opens, before a single byte of the new value is
+    // written - a crash in that window (this runs after every insert batch,
+    // including throughout crash recovery replay) leaves a zero-byte
+    // .root, which load_root_page silently reads back as "root is page 0"
+    // even when it isn't. rename() is atomic within a filesystem, so any
+    // reader always sees either the old id or the new one, never a
+    // truncated file.
+    char tmp_filename[520];
+    snprintf(tmp_filename, sizeof(tmp_filename), "%s.tmp", filename);
+
+    FILE* file = fopen(tmp_filename, "wb");
     if (file == NULL) return;
     fwrite(&root_page_id, sizeof(uint32_t), 1, file);
     fclose(file);
+    rename(tmp_filename, filename);
 }
 
 uint32_t load_root_page(const char* current_db, const char* table_name) {

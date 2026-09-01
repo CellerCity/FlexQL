@@ -137,6 +137,10 @@ int execute_drop_table(const char* current_db, ParsedQuery* query) {
 
     snprintf(filepath, sizeof(filepath), "%s/%s/%s.dat", DATA_DIR, current_db, query->table_name);
     remove(filepath);
+    // The shared Pager for this table is keyed by this exact path. If we
+    // leave its registry entry in place, a table later re-created at the
+    // same path would silently reuse a Pager pointing at the deleted file.
+    pager_retire(filepath);
 
     char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
     delete_root_page(db_path, query->table_name);
@@ -362,7 +366,10 @@ int execute_create(const char* current_db, ParsedQuery* query) {
         BTreeNode* root_node = (BTreeNode*)root_page->data;
         root_node->is_leaf = 1; root_node->is_root = 1; root_node->num_keys = 0;
         unpin_page(pager, 0, 1);
-        pager_close(pager);
+        // Make the root page durable now, not whenever LRU eviction next
+        // happens to run. Without this, the file existing on disk doesn't
+        // mean its root page does - see pager_flush_all()'s comment.
+        pager_flush_all(pager);
         return 0; // SUCCESS
     }
     return -1; // FAILURE
@@ -387,6 +394,10 @@ int execute_delete(const char* current_db, ParsedQuery* query) {
     }
 
     remove(filepath);
+    // Retire the OLD shared Pager for this exact path before reopening it -
+    // otherwise pager_open() below would find the stale registry entry and
+    // hand back a Pager still pointing at the file we just unlinked.
+    pager_retire(filepath);
     Pager* pager = pager_open(filepath);
     if (pager == NULL) { pthread_rwlock_unlock(t_lock); return -1; }
     Page* root_page = get_page(pager, 0);
@@ -394,7 +405,7 @@ int execute_delete(const char* current_db, ParsedQuery* query) {
     BTreeNode* root_node = (BTreeNode*)root_page->data;
     root_node->is_leaf = 1; root_node->is_root = 1; root_node->num_keys = 0;
     unpin_page(pager, 0, 1);
-    pager_close(pager);
+    pager_flush_all(pager); // Same reason as execute_create() - make it durable now.
 
     char db_path[512]; snprintf(db_path, sizeof(db_path), "%s/%s", DATA_DIR, current_db);
     delete_root_page(db_path, query->table_name); // Fresh table, root is page 0 again.
@@ -443,7 +454,15 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
 
     char* ptr = query->bulk_insert_ptr;
     char tuple_buffer[MAX_TUPLE_SIZE];
-    
+
+    // Whether this table even has a B+Tree worth tracking a root for - skip
+    // all the sidecar I/O below for heap-only tables (e.g. no-PK benchmark
+    // tables), where root_page_id is meaningless anyway.
+    int table_has_pk = 0;
+    for (int i = 0; i < cached_num_cols; i++) {
+        if (cached_schema[i].is_primary_key) { table_has_pk = 1; break; }
+    }
+
     // Grab EXCLUSIVE Write Lock!
     pthread_rwlock_t* t_lock = get_table_lock(query->table_name);
     if (t_lock == NULL) {
@@ -452,6 +471,14 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
         return -1;
     }
     pthread_rwlock_wrlock(t_lock);
+
+    // Re-read the root fresh now that we hold the exclusive lock. The value
+    // the caller passed in may have been cached since this connection last
+    // attached to this table, and another connection could have split the
+    // tree - and saved a newer root - any time since. Every exit below
+    // saves it back before unlocking, so the next lock holder (this
+    // connection or another) always sees a state that's actually current.
+    if (table_has_pk) *root_page_id = load_root_page(db_path, query->table_name);
 
     while (*ptr != '\0') {
         if (*ptr == '(') {
@@ -478,7 +505,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
             if (query->value_count != cached_num_cols) {
                 char err[128]; snprintf(err, 128, "ERROR|Column count mismatch. Expected %d, got %d.\n", cached_num_cols, query->value_count);
                 send(client_sock, err, strlen(err), 0);
-                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+                if (table_has_pk) save_root_page(db_path, query->table_name, *root_page_id);
+                pager_flush_all(pager); // Same statement, same durability granularity as the WAL fflush.
                 pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
                 return -1;
             }
@@ -489,7 +518,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
                     if (strlen(query->values[i]) == 0 || strcasecmp(query->values[i], "NULL") == 0) {
                         char err[128]; snprintf(err, 128, "ERROR|NOT NULL constraint violation on column '%s'.\n", cached_schema[i].name);
                         send(client_sock, err, strlen(err), 0);
-                        free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                        free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+                        if (table_has_pk) save_root_page(db_path, query->table_name, *root_page_id);
+                        pager_flush_all(pager); // Same statement, same durability granularity as the WAL fflush.
                         pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
                         return -1;
                     }
@@ -536,7 +567,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
 
                     const char* err = "ERROR|Duplicate Primary Key constraint violation.\n";
                     send(client_sock, err, strlen(err), 0);
-                    free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                    free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+                    if (table_has_pk) save_root_page(db_path, query->table_name, *root_page_id);
+                    pager_flush_all(pager); // Same statement, same durability granularity as the WAL fflush.
                     pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
                     return -1;
                 }
@@ -548,7 +581,9 @@ int execute_insert(const char* current_db, Pager* pager, uint32_t* root_page_id,
 type_err:
                 const char* err = "ERROR|Invalid datatype or missing required field.\n";
                 send(client_sock, err, strlen(err), 0);
-                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL; 
+                free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+                if (table_has_pk) save_root_page(db_path, query->table_name, *root_page_id);
+                pager_flush_all(pager); // Same statement, same durability granularity as the WAL fflush.
                 pthread_rwlock_unlock(t_lock); // <--- Unlock the lock
                 return -1;
             }
@@ -565,6 +600,8 @@ type_err:
     }
 
     free(query->bulk_insert_ptr); query->bulk_insert_ptr = NULL;
+    if (table_has_pk) save_root_page(db_path, query->table_name, *root_page_id);
+    pager_flush_all(pager); // Same statement, same durability granularity as the WAL fflush.
     pthread_rwlock_unlock(t_lock); // Release lock!
     return 0;
 }
@@ -747,6 +784,18 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
             return;
         }
         pthread_rwlock_rdlock(t_lock);
+    }
+
+    // Re-read the primary table's root page id now that we actually hold
+    // the lock, instead of trusting whatever the connection had cached from
+    // an earlier attach. A concurrent writer on another connection could
+    // have split the tree (and moved the root) since we last looked - a
+    // read lock only guarantees no writer is active *right now*, not that
+    // our own stale in-memory copy is still correct.
+    {
+        char root_db_path[512];
+        snprintf(root_db_path, sizeof(root_db_path), "%s/%s", DATA_DIR, current_db);
+        root_page_id = load_root_page(root_db_path, query->table_name);
     }
 
     // =========================================================
@@ -1103,7 +1152,8 @@ void execute_select(const char* current_db, Pager* pager, uint32_t root_page_id,
         char done_msg[128]; snprintf(done_msg, sizeof(done_msg), "DONE|%d rows returned from Join.\n", rows_sent);
         send(client_sock, done_msg, strlen(done_msg), 0);
         
-        pager_close(pager_B);
+        // Not pager_close(pager_B) - it's the shared pager for table B, not
+        // this join's to destroy.
 
         unlock_join_locks(t_lock, t_lock_B); // Release both (or the one, for a self-join)
         return;

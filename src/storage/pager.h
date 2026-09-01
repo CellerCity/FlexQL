@@ -45,11 +45,19 @@ typedef struct {
 } Pager;
 
 // --- Function Prototypes ---
+// pager_open() returns the one Pager shared by every connection for a given
+// file path - see the registry comment in pager.c. pager_close() is a
+// deliberate no-op for a connection merely detaching from a table.
+// pager_retire() is the only real teardown, used solely when a table's file
+// is being destroyed and rebuilt (DROP TABLE / DELETE), by whichever
+// connection already holds that table's exclusive write lock.
 Pager* pager_open(const char* filename);
 Page* get_page(Pager* pager, uint32_t page_num);
 void unpin_page(Pager* pager, uint32_t page_num, int is_dirty); // NEW: Releases the page
 void pager_flush(Pager* pager, CacheNode* node);
-void lru_evict(Pager* pager); 
+void pager_flush_all(Pager* pager); // Flushes every dirty page WITHOUT closing the pager
+void lru_evict(Pager* pager);
 void pager_close(Pager* pager);
+void pager_retire(const char* filename);
 
 #endif

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "pager.h"
 
 // --- Helper: Hash Function ---
@@ -12,8 +13,43 @@ uint32_t hash_page(uint32_t page_num) {
     return page_num % HASH_TABLE_SIZE;
 }
 
+static void pager_close_raw(Pager* pager);
+
+// --- 0. The Shared Pager Registry ---
+// Every field below - the global_cache_lock mutex, the per-page rwlock, the
+// pin_count - was already built to make a Pager safe to share across
+// threads. But every caller opened its OWN private Pager per connection for
+// the same file, so none of that machinery ever saw real cross-thread
+// contention. Two connections writing the same table each had their own
+// disconnected view of it: one connection's newly-written pages were
+// invisible to another's cache and, worse, to another's num_pages
+// bookkeeping - which could make an already-written page look "brand new"
+// and hand back malloc()'s uninitialized garbage instead of the real page.
+// Confirmed live: this crashed the server outright (SIGSEGV in the B+Tree
+// search reading garbage "keys").
+//
+// The fix is to actually share one Pager per file across every connection,
+// which is what this registry does. pager_open() below now returns the same
+// Pager instance to every caller for the same path instead of opening a new
+// one; pager_close() from a connection just detaching from a table is now a
+// no-op (the pager isn't this connection's to destroy), and pager_retire()
+// is the only thing that actually closes and forgets a shared pager - used
+// solely by DROP TABLE and the DELETE truncate/rebuild path, both of which
+// already hold that table's exclusive write lock when they call it.
+#define MAX_OPEN_PAGERS 200
+typedef struct {
+    char filepath[512];
+    Pager* pager;
+} PagerRegistryEntry;
+
+static PagerRegistryEntry pager_registry[MAX_OPEN_PAGERS];
+static int num_open_pagers = 0;
+static pthread_mutex_t pager_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // --- 1. Open the Database and Initialize LRU ---
-Pager* pager_open(const char* filename) {
+// The actual file-open logic, run once per distinct file path for the life
+// of the server. Never call this directly - go through pager_open() below.
+static Pager* pager_open_raw(const char* filename) {
     int fd = open(filename, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd == -1) {
         // This used to exit(EXIT_FAILURE) here, which took the whole server
@@ -25,9 +61,9 @@ Pager* pager_open(const char* filename) {
         return NULL;
     }
 
-    
+
     off_t file_length = lseek(fd, 0, SEEK_END);
-    
+
     Pager* pager = malloc(sizeof(Pager));
     pager->file_descriptor = fd;
     pager->file_length = file_length;
@@ -47,6 +83,42 @@ Pager* pager_open(const char* filename) {
         pager->lookup_table->buckets[i] = NULL;
     }
 
+    return pager;
+}
+
+// The public entry point - every caller in the codebase already calls this
+// exact name, so callers needed no changes. Returns the one shared Pager
+// for this path, opening it the first time and handing back the same
+// instance to every later caller.
+Pager* pager_open(const char* filename) {
+    pthread_mutex_lock(&pager_registry_lock);
+
+    for (int i = 0; i < num_open_pagers; i++) {
+        if (strcmp(pager_registry[i].filepath, filename) == 0) {
+            Pager* existing = pager_registry[i].pager;
+            pthread_mutex_unlock(&pager_registry_lock);
+            return existing;
+        }
+    }
+
+    if (num_open_pagers >= MAX_OPEN_PAGERS) {
+        pthread_mutex_unlock(&pager_registry_lock);
+        fprintf(stderr, "[-] Too many distinct open tables this server run (limit %d).\n", MAX_OPEN_PAGERS);
+        return NULL;
+    }
+
+    Pager* pager = pager_open_raw(filename);
+    if (pager == NULL) {
+        pthread_mutex_unlock(&pager_registry_lock);
+        return NULL;
+    }
+
+    strncpy(pager_registry[num_open_pagers].filepath, filename, sizeof(pager_registry[0].filepath) - 1);
+    pager_registry[num_open_pagers].filepath[sizeof(pager_registry[0].filepath) - 1] = '\0';
+    pager_registry[num_open_pagers].pager = pager;
+    num_open_pagers++;
+
+    pthread_mutex_unlock(&pager_registry_lock);
     return pager;
 }
 
@@ -228,8 +300,47 @@ void unpin_page(Pager* pager, uint32_t page_num, int is_dirty) {
 }
 
 
-// --- 6. Safely Close and Flush Everything ---
-void pager_close(Pager* pager) {
+// --- 6. Flush every dirty page, but keep the pager (and its cache) alive ---
+// Sharing one Pager per file (see the registry above) fixed cross-connection
+// *visibility* - a write is immediately visible to every other connection
+// via the shared in-memory cache. It does NOT by itself make anything
+// durable: nothing writes a page to disk anymore except LRU eviction, since
+// a connection detaching no longer closes (and flushes) the pager.
+//
+// That's a real gap, not just a performance one: execute_create()'s "this
+// table's file already exists, so it survived the crash - skip
+// re-initializing it" shortcut assumes a table's root page is on disk the
+// moment the file exists. Confirmed live: without this, CREATE TABLE
+// followed immediately by kill -9 leaves a genuine 0-byte .dat file: the
+// next boot's replay sees the file "exists", trusts it, and hands
+// btree_search a root page that's never been initialized - is_leaf and the
+// child-page array are malloc()'s uninitialized garbage, and the search
+// spins forever routing through garbage child pointers. Confirmed via a
+// live repro that this hangs the server (not a mutex deadlock - traced with
+// instrumented get_page() calls showing an actual infinite loop).
+//
+// Called once after a table's root page is created/rebuilt (so file
+// existence is trustworthy again) and once at the end of every INSERT
+// batch, alongside the WAL fflush that already happens at the same
+// granularity - so a completed statement's data is durable before the lock
+// protecting it is released, not left to accumulate in RAM indefinitely.
+void pager_flush_all(Pager* pager) {
+    pthread_mutex_lock(&pager->global_cache_lock);
+    CacheNode* curr = pager->head;
+    while (curr != NULL) {
+        if (curr->is_dirty) {
+            pager_flush(pager, curr);
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&pager->global_cache_lock);
+}
+
+// --- 7. Safely Close and Flush Everything ---
+// The actual teardown logic. Never call this directly except from
+// pager_retire() below - it destroys state every other connection sharing
+// this Pager is relying on.
+static void pager_close_raw(Pager* pager) {
     // Destroy the global lock
     pthread_mutex_destroy(&pager->global_cache_lock);
 
@@ -249,4 +360,35 @@ void pager_close(Pager* pager) {
     free(pager->lookup_table);
     close(pager->file_descriptor);
     free(pager);
+}
+
+// A connection detaching from a table (switching to another table, or
+// disconnecting) does NOT own the shared Pager and must not destroy it -
+// other connections may still be using it. This is now a deliberate no-op;
+// every caller in the codebase already calls pager_close() at exactly the
+// points where it used to detach, so none of those call sites needed to
+// change.
+void pager_close(Pager* pager) {
+    (void)pager;
+}
+
+// The only real teardown path: used solely when a table's underlying file
+// is being destroyed and rebuilt (DROP TABLE, or DELETE's truncate/rebuild),
+// so any registry entry pointing at the old file must be retired before a
+// fresh one can be opened at the same path. Both callers already hold that
+// table's exclusive write lock, so no other connection can be inside
+// execute_insert/execute_select for this table concurrently.
+void pager_retire(const char* filename) {
+    pthread_mutex_lock(&pager_registry_lock);
+
+    for (int i = 0; i < num_open_pagers; i++) {
+        if (strcmp(pager_registry[i].filepath, filename) == 0) {
+            pager_close_raw(pager_registry[i].pager);
+            pager_registry[i] = pager_registry[num_open_pagers - 1];
+            num_open_pagers--;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&pager_registry_lock);
 }
